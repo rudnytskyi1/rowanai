@@ -1,0 +1,3 @@
+# Operates the user's ordinary browser through Windows UI Automation.
+comtypes
+psutil>=5.9

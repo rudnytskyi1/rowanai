@@ -1,0 +1,28 @@
+# Jarvis room client - OPTIONAL camera stack (SPEC v1.4, client/camera.py).
+#
+# Install these into the SAME `jarvis` env as client/requirements.txt, but ONLY
+# AFTER a CUDA build of torch is already there:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r client/requirements-camera.txt
+#
+# Order matters. With no torch installed, ultralytics pulls the plain PyPI
+# wheel, which is CPU-only: YOLO would then run on the processor instead of the
+# room PC's GPU and never reach the configured fps. Installing CUDA torch first
+# makes pip keep it (the requirement is already satisfied).
+#
+# Without this file installed the client simply logs one warning and runs
+# voice-only - the wake word, VAD, actions and TTS do not depend on it.
+
+ultralytics          # YOLO11 person/object detection (cfg.client.camera.model)
+lap>=0.5.12          # BoT-SORT assignment; install up front instead of at camera startup
+opencv-python        # VideoCapture for the room camera + JPEG encoding
+
+# --- overlay HUD (client/overlay.py) - NOT camera-related ---
+# The room-TV overlay is a transparent, click-through QWebEngineView showing
+# client/overlay_web/chat.html (centered personal chat with real CSS alpha).
+# Only needed for the HUD: without these, client.overlay just logs one
+# warning, OverlayHUD.enabled stays False, and every method is a no-op - the
+# wake word / VAD / actions / TTS never depend on it.
+PySide6-Essentials   # QtCore/QtGui/QtWidgets - the QApplication + window
+PySide6-Addons       # QtWebEngineWidgets - the transparent WebView itself

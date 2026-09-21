@@ -1,0 +1,22 @@
+# Jarvis room client (living-room PC). Install into the conda env `jarvis`:
+#   pip install -r client/requirements.txt
+# Versions are intentionally unpinned.
+
+# --- client core (W2) ---
+vosk                 # wake word (grammar-mode KaldiRecognizer)
+sounddevice          # microphone capture / PCM playback (PortAudio)
+webrtcvad-wheels     # VAD; NOT `webrtcvad` — no prebuilt Windows wheels there
+websockets           # WebSocket transport to the brain server
+numpy                # PCM helpers (beeps, resampling)
+pillow               # screenshots for look_at_screen (client/screen.py)
+pyyaml               # config.yaml
+pydantic>=2,<3        # standalone client config models
+
+# --- actions & devices (W3) ---
+pycaw                # Windows master volume (IAudioEndpointVolume)
+comtypes             # COM plumbing used by pycaw
+psutil>=5.9          # app inventory and ordinary browser process identity
+bleak                # BLE for SwitchBot Bot
+flux_led             # Magic Home / Zengge Wi-Fi LED controllers
+tinytuya             # Tuya Wi-Fi bulbs / strips
+keyboard             # media keys fallback

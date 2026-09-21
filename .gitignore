@@ -1,0 +1,38 @@
+# Local configuration, credentials and backups
+/config*.yaml*
+!/config.example.yaml
+.env
+.env.*
+*.dpapi
+*.pem
+*.key
+*.pfx
+id_ed25519*
+id_rsa*
+ssh*/
+secrets*/
+credentials*/
+# Recordings, personal browser profiles, conversations and downloaded models
+/data/
+/models/
+/voices.json
+*.log
+*.sqlite*
+*.db
+*.wav
+*.mp3
+*.mp4
+*.pt
+*.onnx
+*.bak
+# Local tools and build artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+dist/
+Thumbs.db
+desktop.ini

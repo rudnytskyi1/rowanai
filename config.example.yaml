@@ -1,0 +1,49 @@
+# Copy to config.yaml or run setup-client.bat. Never commit config.yaml.
+# Ask your server operator for the actual WebSocket address.
+client:
+  server_url: ws://127.0.0.1:8765/ws
+  client_id: my-room
+  workplace_name: Living room   # Displayed in Telegram; unique client_id per PC
+  wakeword:
+    word: rowan ai
+    phrases: [rowan ai, rowan a i, roan ai, roan a i, rowen ai, rowen a i, rowanai]
+    vosk_model: models/vosk-model-small-en-us-0.15
+  audio:
+    input_device: null
+    output_device: null
+    sample_rate: 16000
+    echo_cancellation: false
+    noise_suppression: false
+    noise_suppression_level: 1
+  vad:
+    aggressiveness: 2
+    silence_ms: 1100
+    max_utterance_s: 25
+    pre_roll_ms: 1500
+    min_speech_ms: 250
+  camera:
+    enabled: false
+    name: Main camera
+    index: 0
+    stream_url: null
+    width: 1920
+    height: 1080
+    fps: 0                     # No software limit; processes fresh frames
+    half: true
+    model: yolo11n.pt           # Local Ultralytics detector; e.g. yolo11s.pt
+    face_check_interval_s: 0.5
+    frame_recording:
+      enabled: false
+      retention_days: 0
+      max_gb: 0
+      min_free_gb: 5
+  overlay:
+    enabled: true
+    position: bottom_right
+    idle_hidden: false
+    scale: 1.0
+  followup_window_s: 0
+  attention_mode: wake_word
+  thinking_sounds: true
+  apps: {}
+  devices: []

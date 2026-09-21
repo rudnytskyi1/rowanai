@@ -1,0 +1,3 @@
+# Desktop chat overlay (optional for voice-only clients).
+PySide6-Essentials
+PySide6-Addons
