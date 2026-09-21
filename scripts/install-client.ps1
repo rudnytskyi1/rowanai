@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([string]$Python)
+param([string]$Python, [switch]$Conda)
 $ErrorActionPreference = 'Stop'
 $rowanRoot = Split-Path -Parent $PSScriptRoot
-$rowanPython = Join-Path $rowanRoot '.venv\Scripts\python.exe'
+. (Join-Path $PSScriptRoot 'client-python.ps1')
 $env:PYTHONUTF8 = '1'
 $env:PYTHONUNBUFFERED = '1'
 
@@ -14,10 +14,14 @@ function Invoke-RowanPython {
 
 Push-Location $rowanRoot
 try {
+    if ($Conda) {
+        $rowanPython = Resolve-RowanPython -Root $rowanRoot -Python $Python -Conda
+    } else {
+        $rowanPython = Resolve-RowanPython -Root $rowanRoot -AllowMissingDefault
+    }
     if (-not (Test-Path -LiteralPath $rowanPython)) {
         if ($Python) {
-            & $Python -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 12) and sys.maxsize > 2**32 else 1)'
-            if ($LASTEXITCODE -ne 0) { throw 'Use Python 3.11 or 3.12 (64-bit).' }
+            $Python = Test-RowanPython -Python $Python
             & $Python -m venv .venv
             if ($LASTEXITCODE -ne 0) { throw 'Could not create the Python environment.' }
         } else {
@@ -39,6 +43,10 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Could not create the Python environment.' }
         }
     }
+    $rowanPython = Test-RowanPython -Python $rowanPython
+    Enable-RowanPythonEnvironment -Python $rowanPython
+    if ($Conda) { Save-RowanPython -Root $rowanRoot -Python $rowanPython }
+    Write-Host "Using Python: $rowanPython"
     Invoke-RowanPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip')
     Invoke-RowanPython -Arguments @('-m', 'pip', 'install', '-r', 'client/requirements.txt', '-r', 'client/requirements-browser.txt', '-r', 'client/requirements-overlay.txt')
     Invoke-RowanPython -Arguments @('-m', 'client.setup')

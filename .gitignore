@@ -26,6 +26,8 @@ credentials*/
 *.onnx
 *.bak
 # Local tools and build artifacts
+.rowan-python
+.rowan-python.bak-*
 .venv/
 venv/
 __pycache__/

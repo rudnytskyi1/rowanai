@@ -2,11 +2,13 @@
 param()
 $ErrorActionPreference = 'Stop'
 $rowanRoot = Split-Path -Parent $PSScriptRoot
-$rowanPython = Join-Path $rowanRoot '.venv\Scripts\python.exe'
+. (Join-Path $PSScriptRoot 'client-python.ps1')
+$rowanPython = Resolve-RowanPython -Root $rowanRoot
+Enable-RowanPythonEnvironment -Python $rowanPython
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Install Git for Windows first.' }
 if (-not (Test-Path -LiteralPath (Join-Path $rowanRoot '.git'))) { throw 'Automatic updates require a Git clone. See README: Updating.' }
-if (-not (Test-Path -LiteralPath $rowanPython)) { throw 'Run setup-client.bat first.' }
 $env:PYTHONUTF8 = '1'
+Write-Host "Using Python: $rowanPython"
 Push-Location $rowanRoot
 try {
     $rowanChanges = & git status --porcelain --untracked-files=no

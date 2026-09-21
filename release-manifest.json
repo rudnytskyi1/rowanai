@@ -1,8 +1,8 @@
 {
   "format": 1,
   "files": {
-    ".gitignore": "a4f2479943c65670c871b371ed6cb52981c17c6aec2a7efc5a7db9e758e05f7d",
-    "README.md": "4079429a697942268afb92f95f4bdb89a9bd705859e6c9cb5317d3dbc6e10817",
+    ".gitignore": "0c1d24261f25322029b7a36453e1343c158c01a01ce8a9f941b61bebcfe0979e",
+    "README.md": "6f0ef6ea1c1fc75db528d2f6dc1b743207b9479d30a0881467811b6364b2aba1",
     "client/__init__.py": "b1e6f8d05a78c18f018f66c6b641e4c828fd507e85a685f4f7da2da895146195",
     "client/actions/__init__.py": "b8d81a6154211d8386ea49d67b03e61aa97abe561b4f94befbb163eb04a909a0",
     "client/actions/app_control.py": "37e1746c8ed46eaa565bb3505b1d1842f304ae49ef7e2e6a831f916955ef666b",
@@ -47,10 +47,13 @@
     "common/recording.py": "188e43312175d4c662df2f50bccdfa6cb28b883f56c23ed67d6440b3f3338ae7",
     "common/voice_commands.py": "58b8c930faa8812e698e9dc99e2418954aed9e7ac0faf184f2e69c35ac813203",
     "config.example.yaml": "fecb2007a5513c82b2aab3aa2b0a6fb100316c90e26f0f41b268e35529f95174",
-    "scripts/install-client.ps1": "9af42d6e5e2391e26934b7219c6679a17cacb3ecc55b779c52a4d05c88c37b68",
-    "scripts/run-client.ps1": "30367f5bf2e3e98b709554f40cbc9be683669df00f4bf047d77a9a9dfb71d6bb",
-    "scripts/update-client.ps1": "354f820d4ecdfd62fbd3f45539c841e6304c750056364eec78c32f5917bdfe6e",
+    "scripts/client-python.ps1": "b24f8cce505ff796b1388b6ce44a2a3f1e4354dc234f895959cfaa7e2becb8f2",
+    "scripts/install-client.ps1": "7d567e96904cb316b8396ebef4f2ee0eae7c893682d331e016952e758ef94f7c",
+    "scripts/run-client.ps1": "8d5b6f9ef31ddadf309d50cc39eb000ca449b8afd6b3cd6bfcfedc1020f477ae",
+    "scripts/update-client.ps1": "3561487793618ed85830b7db58839a2187c65703244c15d085a37ecc5a257e3b",
+    "setup-client-conda.bat": "64c707b4cbe6c5d6c3f2c3637852003e762c7f982211a6039b505f2066c1e467",
     "setup-client.bat": "e40945ca024f652230b2fb88d15ab104e070b32ea336bcaa80f22817cfa118b9",
+    "start-client-conda.bat": "10c5c6cb84e6ad9c0c878a5b627bd36d0c1c598ca3a24c5cd960821b63c849fa",
     "start-client.bat": "4bd17f076b701300ec4082eecd02549726f83441600aab288add75ed8b80549c",
     "update-client.bat": "2b67214462f0e82c2403910bd225228fc117ec07b6353498b875ca785b3bdacc"
   }
