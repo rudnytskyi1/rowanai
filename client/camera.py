@@ -167,6 +167,28 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def yolo_placement() -> tuple[Any, bool]:
+    """Where YOLO runs: GPU 0 with FP16 when torch can, otherwise the CPU.
+
+    A room PC without CUDA - a friend's laptop, for instance - answered every
+    ``device=0`` with "Invalid CUDA 'device=0' requested", and the camera stack
+    then switched itself off ("YOLO inference keeps failing") even though CPU
+    inference handles a single 1080p stream. Detecting the card here keeps one
+    inference stream working instead of losing the camera entirely.
+    """
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 - torch is optional for the client
+        log.debug("torch is unavailable (%s); YOLO will run on the CPU", exc)
+        return "cpu", False
+    try:
+        if bool(torch.cuda.is_available()) and int(torch.cuda.device_count()) > 0:
+            return 0, True
+    except Exception as exc:  # noqa: BLE001 - a broken CUDA init means the CPU
+        log.debug("CUDA cannot be used (%s); YOLO will run on the CPU", exc)
+    return "cpu", False
+
+
 class CameraService:
     """Capture + YOLO worker pair that reports presence over the WebSocket.
 
@@ -198,7 +220,10 @@ class CameraService:
         self.height = _as_int(_attr(cfg_camera, 'height', CAPTURE_HEIGHT), CAPTURE_HEIGHT)
         requested_fps = _as_float(_attr(cfg_camera, 'fps', 5), 5.)
         self.fps = 0. if requested_fps == 0 else min(MAX_FPS, max(MIN_FPS, requested_fps))
-        self.half = bool(_attr(cfg_camera, 'half', True))
+        #: ТЗ F-312 works on whatever this PC has: GPU 0 when the card is
+        #: usable, the CPU otherwise. FP16 only ever means something on a GPU.
+        self.device, gpu_ready = yolo_placement()
+        self.half = bool(_attr(cfg_camera, 'half', True)) and gpu_ready
         self._recording_cfg = _attr(cfg_camera, 'frame_recording')
         self._frame_recorder = None
         self._archive_error = ''
@@ -752,8 +777,10 @@ class CameraService:
             try:
                 model = yolo_class(profile.model)
                 loaded[profile.name] = model
-                return measure_ms(lambda: model.predict(source=frame, imgsz=640, device=0,
-                                                        half=profile.half, conf=CONF_THRESHOLD,
+                return measure_ms(lambda: model.predict(source=frame, imgsz=640,
+                                                        device=self.device,
+                                                        half=bool(profile.half) and self.half,
+                                                        conf=CONF_THRESHOLD,
                                                         verbose=False),
                                   frames=self.profile_measure_frames)
             except Exception as exc:  # noqa: BLE001 - записанная причина важнее трейсбека
@@ -799,8 +826,8 @@ class CameraService:
             except Exception as exc:  # noqa: BLE001 - weights download / CUDA errors
                 self._fail(f"the YOLO model {self.model_name!r} could not be loaded: {exc}")
                 return
-        log.info('YOLO model %s loaded, CUDA FP16=%s, FPS limit=%s%s',
-                 self.model_name, self.half, self.fps or 'unlimited',
+        log.info('YOLO model %s loaded, device=%s, FP16=%s, FPS limit=%s%s',
+                 self.model_name, self.device, self.half, self.fps or 'unlimited',
                  (f', profile {self.profile_name}'
                   f' ({self.profile_latency_ms:.0f} ms/frame, {self.profile_reason})')
                  if self.profile_name else '')
@@ -884,7 +911,7 @@ class CameraService:
             tracker=str(tracker),
             conf=CONF_THRESHOLD,
             verbose=False,
-            device=0,
+            device=self.device,
             imgsz=640,
             half=self.half,
         )

@@ -18,7 +18,7 @@
     "client/audio_processing.py": "0346ccc44c94ddd9caa85d43587227d9254f66ee71d04ffea38426dc5916c00a",
     "client/barge_in.py": "8602e5b9c2d61b49cd4b03ad3656b95ab7bd494b1d2a2463d222324efeda7eb8",
     "client/body_crops.py": "4aa30b05d1e8453cc3aaf2d6734051d57aad5ad5901bda7ecce7e19f5575c91c",
-    "client/camera.py": "6018e789ff431b08206bceb3bd3cb89892adbfb6f899b16cd233a28df1b3677c",
+    "client/camera.py": "4f7165ec9b80e02f44af87d75c93fa83f62e7aaa87dd4564552da2d8d2164b4e",
     "client/camera_clips.py": "b08e07b2071d73bf9b043f4070b2182e15c1311c589ac83f433bcfe449e8648f",
     "client/devices/__init__.py": "66f589e5533cc8ea9cfd368d3cd6d1c26520c55c24ff4af01d5c2c10e5f018ed",
     "client/devices/base.py": "0c4bd679db9ecdc007c7bb7ba7b7b8916c54ea726eb5c53da92ed4cd8562a258",
