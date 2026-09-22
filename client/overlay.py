@@ -126,6 +126,10 @@ HIDE_DELAY_S = 0.55
 #: activity for as long as the client ran. A badge now announces itself for
 #: this long and then hands the screen back.
 BADGE_HOLD_S = 6.0
+#: How often the HUD re-asserts itself while a photo owns the screen. The
+#: photo's own window re-pins on every pump (~60 times a second); 4 times a
+#: second is enough to win, and cheap enough to leave running while it is up.
+TOP_GUARD_INTERVAL_MS = 250
 
 #: The actual page shown in the WebView (client/overlay_web/hud.html).
 HUD_HTML_PATH = Path(__file__).resolve().parent / "overlay_web" / "chat.html"
@@ -365,6 +369,10 @@ class OverlayHUD:
         self._click_until = 0.0
         self._mapped = False
         self._capture_suspended = False
+        #: Until when the HUD re-asserts itself above other topmost windows.
+        #: The detections photo re-pins itself on every pump, so a HUD that
+        #: asked for topmost once ended up underneath the picture it annotates.
+        self._top_guard_until = 0.0
         self._chat = {"person": "", "messages": [], "question": ""}
 
     # ------------------------------------------------------------------
@@ -602,6 +610,25 @@ class OverlayHUD:
     def resume_capture(self) -> None:
         self._post(lambda bridge: bridge.capture_finished.emit())
 
+    def keep_on_top(self, seconds: float = 0.0) -> None:
+        """Put the HUD back above other always-on-top windows.
+
+        The detections photo (``client/viewer.py``) re-pins itself with
+        ``SetWindowPos(HWND_TOPMOST)`` on every message-loop pump, so a window
+        that only asked for topmost once at show time is pushed under the
+        picture the HUD is supposed to annotate. ``seconds`` keeps the HUD
+        raising itself for as long as that picture is on screen (0 = once):
+        the raise never activates the window and never takes the keyboard.
+        """
+        if not self.enabled:
+            return
+        try:
+            window = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            window = 0.0
+        self._top_guard_until = max(self._top_guard_until, time.monotonic() + window)
+        self._post(lambda bridge: bridge.raise_requested.emit())
+
     def hide_now(self) -> None:
         """Take the window off screen immediately, skipping the fade-out delay.
 
@@ -698,6 +725,7 @@ class OverlayHUD:
             hub_changed = Signal(str)
             tracks_changed = Signal(str)
             photo_changed = Signal(str)
+            raise_requested = Signal()
             capture_requested = Signal(object)
             capture_finished = Signal()
             voice_confirmation = Signal(object)
@@ -723,6 +751,7 @@ class OverlayHUD:
                 self.hub_changed.connect(self._on_hub)
                 self.tracks_changed.connect(self._on_tracks)
                 self.photo_changed.connect(self._on_photo)
+                self.raise_requested.connect(self._on_raise)
                 self.capture_requested.connect(self._on_capture)
                 self.capture_finished.connect(self._on_capture_finished)
                 self.voice_confirmation.connect(self._on_voice_confirmation)
@@ -819,10 +848,32 @@ class OverlayHUD:
                     return
                 try:
                     owner._view.show()
+                    # Showing is what re-asserts the topmost flag; without this
+                    # a photo that appeared in the meantime keeps the top slot.
+                    owner._view.raise_()
                 except Exception:  # noqa: BLE001 - best-effort
                     log.debug("overlay: could not show the window", exc_info=True)
                     return
                 owner._mapped = True
+
+            def _on_raise(self) -> None:
+                """ТЗ F-708/F-102: the HUD wins over the photo window.
+
+                ``raise_`` on a ``WindowStaysOnTopHint`` window is a
+                ``SetWindowPos(HWND_TOPMOST)`` call, which puts this window at
+                the top of the always-on-top band without touching focus. While
+                a picture is on screen the owner asks for it again and again,
+                because the picture re-pins itself even faster.
+                """
+                if owner._view is None or not owner._mapped:
+                    return
+                try:
+                    owner._view.raise_()
+                except Exception:  # noqa: BLE001 - best-effort
+                    log.debug("overlay: could not raise the window", exc_info=True)
+                    return
+                if time.monotonic() < owner._top_guard_until:
+                    QTimer.singleShot(TOP_GUARD_INTERVAL_MS, self._on_raise)
 
             def _hide(self) -> None:
                 if not owner._mapped or owner._view is None:

@@ -2550,6 +2550,10 @@ class JarvisClient:
         if self.viewer is None:
             log.debug("No detections viewer available - ignoring the photo")
             return
+        # ТЗ F-708: the photo window re-pins itself as always-on-top, so the HUD
+        # has to keep winning while it is up - otherwise the badges and the
+        # transcript end up hidden under the picture the owner asked for.
+        self.overlay.keep_on_top(ttl_s + 1.0)
         try:
             await asyncio.to_thread(self.viewer.show, data, title, ttl_s)
         except Exception as exc:  # noqa: BLE001 - never let a viewer bug break the reader
