@@ -102,6 +102,15 @@ client:
 This is a fragment to merge into your existing client settings, keeping the
 server URL. `fps: 0` processes fresh frames as fast as the camera/GPU allows.
 Select a larger compatible YOLO model if desired; it needs more GPU time.
+ТЗ F-312 adds an optional automatic choice of the detection profile. The client
+then measures each candidate profile on the first captured frame at startup and
+runs the first one whose median inference fits its budget (`tensorrt` →
+`gpu` → `weak`); the `weak` profile is YOLO11s at 10 FPS. The strongest profile
+needs a TensorRT engine, which is built ON this PC by
+`python scripts/export_tensorrt.py --output client/yolo11x.engine` (and cannot be
+downloaded); until it exists that profile is skipped with the reason in the log.
+With `auto_profile: false` (the default) the client uses exactly the `model`,
+`fps` and `half` above.
 One active camera per client is currently supported. Several connected clients
 appear as separate workplaces/cameras in the server owner's Telegram `/tools`
 panel. The owner can choose the camera separately in the group and in DM, take
@@ -155,6 +164,13 @@ environment, first run `conda activate YOUR_ENV` in Anaconda Prompt and use
   `.venv\Scripts\python -m client.setup --check`.
 - Download/retry the wake-word model:
   `.venv\Scripts\python -m client.setup --download-wake-model`.
+- Working without the hub (ТЗ 4.8) needs no extra install in the default
+  profile: after three seconds without the server the room shows "brain
+  offline", says the line the hub synthesized for it earlier
+  (`data/tts_cache/`) and keeps doing its own commands (light, volume, apps,
+  scenes). For spoken commands while the hub is away, install faster-whisper
+  (`pip install faster-whisper`, base or small per `client.offline.stt`); the
+  first local use downloads the model.
 - Logs are local in `data/client.log`; review/redact them before sharing, since
   they may include transcripts and connection details.
 

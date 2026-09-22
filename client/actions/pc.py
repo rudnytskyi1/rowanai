@@ -28,9 +28,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from ctypes import wintypes
-from typing import Any, Iterator, Mapping, NamedTuple, Sequence
+from typing import Any, NamedTuple
 
 from .apps import (
     AppEntry,
@@ -1528,7 +1529,7 @@ class PCController:
 
     async def _resolve_window_app(self, value: Any) -> AppEntry:
         """Window operations resolve the running browser, not Start-menu aliases."""
-        from .app_control import GENERIC_BROWSER, BROWSERS, visible_apps
+        from .app_control import BROWSERS, GENERIC_BROWSER, visible_apps
         from .apps import SOURCE_CONFIG
         if str(value or '').strip().casefold() not in GENERIC_BROWSER:
             return await self._resolve_app(value)

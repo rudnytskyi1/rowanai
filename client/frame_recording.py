@@ -1,8 +1,8 @@
 """Bounded camera writer: native-size JPEGs, no face-recognition dependency."""
 import logging
-from pathlib import Path
 import queue
 import threading
+from pathlib import Path
 
 from common.recording import MediaArchive
 

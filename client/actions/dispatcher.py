@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from ..devices.base import (
     STATE_OFF,
@@ -39,9 +40,9 @@ from ..devices.base import (
     parse_state,
     parse_switch_action,
 )
+from .app_control import AppController
 from .apps import AppError
 from .browser_desktop import DesktopBrowserController
-from .app_control import AppController
 from .pc import PCActionError, PCController, PCResult
 
 log = logging.getLogger(__name__)
@@ -175,11 +176,13 @@ class Dispatcher:
                 output, detail = json.dumps(result), 'Application inventory/action completed'
             elif tool == TOOL_SAVE_PHOTO:
                 import json
+
                 from .photos import save_photo
                 result = await asyncio.wait_for(asyncio.to_thread(save_photo, args), timeout=20)
                 output, detail = json.dumps(result), 'Photo saved'
             elif tool == TOOL_SET_WALLPAPER:
                 import json
+
                 from .wallpaper import set_wallpaper
                 result = await asyncio.wait_for(asyncio.to_thread(set_wallpaper, args), timeout=20)
                 output, detail = json.dumps(result), 'Desktop wallpaper applied and verified'
@@ -202,7 +205,7 @@ class Dispatcher:
 
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             message = f"action {action_id} ({tool}) timed out"
             log.error(message)
             return False, message, None

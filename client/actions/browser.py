@@ -188,7 +188,7 @@ class BrowserController:
                     try:
                         await asyncio.wait_for(page.evaluate(
                             '() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))'), .4)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass  # A minimized browser may throttle animation frames.
                 return await self._snapshot()
             except asyncio.CancelledError:

@@ -49,24 +49,30 @@ is held (the user is talking — the server is not looking at faces anyway).
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
-from copy import deepcopy
-from pathlib import Path
+import logging
 import threading
 import time
-from collections.abc import Mapping
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
 
+from client.body_crops import CropSchedule, encode_crop
+from client.privacy import PrivacyMode
+from client.tracking import TrackRegistry, write_tracker_config
+from common.ids import new_ulid
 from common.protocol import (
     CAMERA_BURST_MAX,
     CAMERA_FORMAT,
     CAMERA_REASON_PRESENCE,
     CAMERA_REASON_REQUEST,
+    MSG_BODY_CROP,
     MSG_CAMERA_ERROR,
     MSG_CAMERA_FRAME,
     MSG_CAMERA_REQUEST,
     MSG_CAMERA_STATE,
+    MSG_TRACKS,
 )
 
 log = logging.getLogger(__name__)
@@ -109,11 +115,13 @@ BURST_FRAME_INTERVAL_S = 0.25
 #: of a burst (a stalled camera must not hang the whole request).
 FRESH_FRAME_WAIT_S = 0.5
 
-SendJson = Callable[[Dict[str, Any]], Awaitable[None]]
+SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 SendBytes = Callable[[bytes], Awaitable[None]]
 
 __all__ = [
     "MSG_CAMERA_STATE",
+    "MSG_TRACKS",
+    "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_REQUEST",
     "MSG_CAMERA_ERROR",
@@ -174,6 +182,15 @@ class CameraService:
         self._track_epoch = uuid.uuid4().hex[:10]
         self._tracks = []
         self._last_tracks_at = 0.0
+        #: ТЗ F-201: the ids of the people in the frame, with a thirty-second
+        #: memory so a person who steps out and comes back keeps the same id.
+        self.tracks = TrackRegistry()
+        self._track_reports: list = []
+        self._sent_track_ids: tuple[str, ...] = ()
+        self._sent_tracks_at = 0.0
+        self._tracks_message = bool(_attr(cfg_camera, 'tracks_message', True))
+        #: ТЗ F-202: on appearance, every 2 s, and whenever the view changes.
+        self._crop_schedule = CropSchedule()
         self._enabled = bool(_attr(cfg_camera, "enabled", False))
         self.index = _as_int(_attr(cfg_camera, "index", 0), 0)
         self.stream_url = str(_attr(cfg_camera, 'stream_url', '') or '').strip()
@@ -189,23 +206,38 @@ class CameraService:
         self._metrics_at = time.monotonic()
         self._metrics_captured = self._metrics_inferred = 0
         self._presence_pending = threading.Event()
+        #: ТЗ F-303: пока privacy-режим включён, кадры не уходят вообще —
+        #: проверяется в каждой точке, где клиент отдаёт картинку.
+        self._privacy_mode = PrivacyMode(str(_attr(cfg_camera, 'language', 'en') or 'en'))
         self.model_name = str(_attr(cfg_camera, "model", "yolo11n.pt") or "yolo11n.pt")
         self.face_check_interval_s = max(
             0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 0.5), 0.5)
         )
+        #: ТЗ F-312: профиль детекции выбирается измеренной задержкой при
+        #: старте. Пока выбор выключен, работают ровно значения конфига выше.
+        self._camera_cfg = cfg_camera
+        self.auto_profile = bool(_attr(cfg_camera, "auto_profile", False))
+        self.profile_measure_frames = max(
+            1, _as_int(_attr(cfg_camera, "profile_measure_frames", 3), 3)
+        )
+        #: Имя выбранного профиля, его замеренная задержка и причина выбора.
+        self.profile_name = ""
+        self.profile_latency_ms: float | None = None
+        self.profile_reason = ""
+        self.profile_attempts: list[dict[str, Any]] = []
 
         # --- wiring to the event loop ---
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._send_json: Optional[SendJson] = None
-        self._send_bytes: Optional[SendBytes] = None
-        self._send_lock: Optional[asyncio.Lock] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._send_json: SendJson | None = None
+        self._send_bytes: SendBytes | None = None
+        self._send_lock: asyncio.Lock | None = None
 
         # --- threads ---
         self._stop_event = threading.Event()
         self._capture_ready = threading.Event()
         self._new_frame = threading.Event()
-        self._capture_thread: Optional[threading.Thread] = None
-        self._infer_thread: Optional[threading.Thread] = None
+        self._capture_thread: threading.Thread | None = None
+        self._infer_thread: threading.Thread | None = None
 
         # --- latest frame ---
         self._frame_lock = threading.Lock()
@@ -222,9 +254,12 @@ class CameraService:
         self._detect_errors = 0
         self._send_errors = 0
         self._frame_seq = 0
-        self._sent_state: Optional[Tuple[int, Tuple[Tuple[str, int], ...]]] = None
+        self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
+        #: ``event_id`` of the request being answered (ТЗ 4.5); empty for an
+        #: unsolicited presence push, which mints its own id.
+        self._request_event_id = ''
 
     # ------------------------------------------------------------------
     # state
@@ -239,10 +274,61 @@ class CameraService:
         return self._enabled
 
     @property
+    def privacy(self) -> PrivacyMode:
+        """ТЗ F-303 mode. Built on demand, so a bare instance still answers.
+
+        ``__init__`` builds it from ``client.camera.language``; an instance made
+        without ``__init__`` (tests, one-off tooling) gets one here instead of an
+        ``AttributeError`` in the middle of the frame path.
+        """
+        mode = getattr(self, "_privacy_mode", None)
+        if mode is None:
+            mode = self._privacy_mode = PrivacyMode("en")
+        return mode
+
+    @privacy.setter
+    def privacy(self, mode: PrivacyMode) -> None:
+        self._privacy_mode = mode
+
+    @property
     def running(self) -> bool:
         """True while the capture thread is alive and delivering frames."""
         thread = self._capture_thread
         return bool(self._enabled and thread is not None and thread.is_alive())
+
+    def set_privacy(self, on: bool, *, reason: str = "") -> bool:
+        """ТЗ F-303: камера перестаёт смотреть (или снова смотрит).
+
+        Включение сразу объявляет хабу, что камера выключена человеком: иначе
+        хаб ждал бы кадров и путал бы «камеру выключили» с «в комнате никого»
+        (F-301). Выключение сбрасывает дебаунс, чтобы первый же кадр ушёл
+        сразу. Микрофон не затрагивается — иначе камеру нельзя было бы вернуть
+        тем же голосом.
+        """
+        changed = self.privacy.set(on, reason=reason)
+        if not changed:
+            return False
+        log.info("Camera privacy mode %s (%s)", "on" if self.privacy.on else "off",
+                 reason or "voice")
+        self._sent_state = None
+        self._last_tracks_at = 0.0
+        payload = {"type": MSG_CAMERA_STATE, "persons": 0, "tracks": [], "objects": {},
+                   "privacy": bool(self.privacy.on)}
+        if self._loop is not None:
+            self._submit(self._send_state(payload))
+        return True
+
+    def announce_privacy(self) -> None:
+        """Tell the hub the CURRENT privacy state, even when it did not change.
+
+        A reconnected client says it again: the hub must not keep believing the
+        camera is on just because the state was set before the link dropped.
+        """
+        if self._loop is None:
+            return
+        self._submit(self._send_state({
+            "type": MSG_CAMERA_STATE, "persons": 0, "tracks": [], "objects": {},
+            "privacy": bool(self.privacy.on)}))
 
     def _fail(self, message: str) -> None:
         """Disable the camera permanently, logging exactly one warning."""
@@ -262,7 +348,8 @@ class CameraService:
         loop: asyncio.AbstractEventLoop,
         send_json: SendJson,
         send_bytes: SendBytes,
-        send_lock: Optional[asyncio.Lock] = None,
+        send_lock: asyncio.Lock | None = None,
+        on_unsent: Any = None,
     ) -> bool:
         """Start the capture and detection threads.
 
@@ -272,6 +359,8 @@ class CameraService:
         :param send_bytes: coroutine function sending one binary frame.
         :param send_lock: optional lock held around every header+binary pair so
             camera frames cannot interleave with streamed microphone audio.
+        :param on_unsent: ТЗ 4.8 — called with a presence frame the socket could
+            not carry, so the client can deliver it after the reconnect.
         :returns: ``True`` if the threads were started.
 
         Returns immediately: importing ``ultralytics`` and opening the device
@@ -283,6 +372,7 @@ class CameraService:
         self._send_json = send_json
         self._send_bytes = send_bytes
         self._send_lock = send_lock
+        self._on_unsent = on_unsent
 
         if not self._enabled:
             log.info("Camera is disabled in the config - running voice only")
@@ -501,7 +591,7 @@ class CameraService:
                 except Exception as exc:  # pragma: no cover - teardown
                     log.debug("Error while releasing the camera: %s", exc)
 
-    def _latest_frame(self) -> Tuple[Any, float]:
+    def _latest_frame(self) -> tuple[Any, float]:
         """The newest captured frame and its age in seconds (``None``, ``inf``)."""
         with self._frame_lock:
             frame = self._frame
@@ -510,7 +600,7 @@ class CameraService:
             return None, float("inf")
         return frame, max(0.0, time.monotonic() - ts)
 
-    def _latest_frame_ts(self) -> Tuple[Any, float]:
+    def _latest_frame_ts(self) -> tuple[Any, float]:
         """The newest captured frame and its OWN monotonic timestamp (not age).
 
         Used by :meth:`_await_fresh_frame` to tell burst frames apart: an age
@@ -520,7 +610,7 @@ class CameraService:
         with self._frame_lock:
             return self._frame, self._frame_ts
 
-    def _await_fresh_frame(self, newer_than: float) -> Tuple[Any, float]:
+    def _await_fresh_frame(self, newer_than: float) -> tuple[Any, float]:
         """Block briefly for a capture-thread frame newer than ``newer_than``.
 
         One slot of a burst must never resend the same JPEG twice: the capture
@@ -613,21 +703,118 @@ class CameraService:
     # ------------------------------------------------------------------
     # detection thread
     # ------------------------------------------------------------------
+    def _probe_frame(self) -> Any:
+        """One frame for the F-312 measurement: the newest, or a blank one."""
+        try:
+            frame, _ = self._latest_frame_ts()
+        except Exception:  # noqa: BLE001 - a missing capture must not block the choice
+            frame = None
+        if frame is not None:
+            return frame
+        try:
+            import numpy as np
+
+            return np.zeros((self.height, self.width, 3), dtype="uint8")
+        except Exception:  # noqa: BLE001 - no numpy, no synthetic frame
+            return None
+
+    def _select_profile(self, yolo_class: Any) -> Any:
+        """ТЗ F-312: pick the profile by measured latency; return its model.
+
+        Each candidate is loaded and timed on the same frame; the first profile
+        whose median inference fits its budget wins, and a profile whose
+        measurement fails is skipped with the reason. ``None`` means nothing
+        could be measured or chosen — the caller then loads the configured model
+        exactly as before, so a broken measurement never costs the client its
+        camera.
+        """
+        from client.vision_profile import choose_profile, measure_ms, plan_profiles
+
+        candidates, skipped = plan_profiles(self._camera_cfg)
+        self.profile_attempts = [
+            {"profile": item.name, "latency_ms": item.latency_ms, "reason": item.reason}
+            for item in skipped
+        ]
+        for item in skipped:
+            log.info("Detection profile %s skipped (%s)", item.name, item.reason)
+        if not candidates:
+            self.profile_reason = "нет доступных профилей"
+            log.warning("No detection profile can be measured; using %s", self.model_name)
+            return None
+        frame = self._probe_frame()
+        if frame is None:
+            self.profile_reason = "нет кадра для замера"
+            log.warning("No frame to measure a detection profile on; using %s", self.model_name)
+            return None
+        loaded: dict[str, Any] = {}
+
+        def measure(profile: Any) -> float:
+            try:
+                model = yolo_class(profile.model)
+                loaded[profile.name] = model
+                return measure_ms(lambda: model.predict(source=frame, imgsz=640, device=0,
+                                                        half=profile.half, conf=CONF_THRESHOLD,
+                                                        verbose=False),
+                                  frames=self.profile_measure_frames)
+            except Exception as exc:  # noqa: BLE001 - записанная причина важнее трейсбека
+                self.profile_attempts.append(
+                    {"profile": profile.name, "latency_ms": None,
+                     "reason": f"загрузка/замер не удались: {type(exc).__name__}: {exc}"})
+                raise
+
+        choice = choose_profile(candidates, measure)
+        if choice is None:
+            self.profile_reason = "замер не удался ни на одном профиле"
+            log.warning("No detection profile could be measured; using %s", self.model_name)
+            return None
+        self.model_name = choice.profile.model
+        self.half = choice.profile.half
+        self.fps = (0. if choice.profile.fps == 0
+                    else min(MAX_FPS, max(MIN_FPS, choice.profile.fps)))
+        self.profile_name = choice.profile.name
+        self.profile_latency_ms = choice.latency_ms
+        self.profile_reason = choice.reason
+        self.profile_attempts.extend(
+            {"profile": item.name, "latency_ms": item.latency_ms, "reason": item.reason}
+            for item in choice.attempts
+        )
+        log.info("Detection profile chosen by measurement: %s", choice.text())
+        return loaded.get(choice.profile.name)
+
     def _infer_loop(self) -> None:
         self._capture_ready.wait()
         if self._stop_event.is_set() or not self._enabled:
             return
         try:
             yolo_class = self._import_yolo()
-            model = yolo_class(self.model_name)
         except CameraUnavailable as exc:
             self._fail(str(exc))
             return
-        except Exception as exc:  # noqa: BLE001 - weights download / CUDA errors
-            self._fail(f"the YOLO model {self.model_name!r} could not be loaded: {exc}")
-            return
-        log.info('YOLO model %s loaded, CUDA FP16=%s, FPS limit=%s',
-                 self.model_name, self.half, self.fps or 'unlimited')
+        # ТЗ F-312: с включённым автовыбором модель подбирается ЗАМЕРОМ, а не
+        # по имени файла; выключенный флаг оставляет ровно прежнее поведение.
+        model = self._select_profile(yolo_class) if self.auto_profile else None
+        if model is None:
+            try:
+                model = yolo_class(self.model_name)
+            except Exception as exc:  # noqa: BLE001 - weights download / CUDA errors
+                self._fail(f"the YOLO model {self.model_name!r} could not be loaded: {exc}")
+                return
+        log.info('YOLO model %s loaded, CUDA FP16=%s, FPS limit=%s%s',
+                 self.model_name, self.half, self.fps or 'unlimited',
+                 (f', profile {self.profile_name}'
+                  f' ({self.profile_latency_ms:.0f} ms/frame, {self.profile_reason})')
+                 if self.profile_name else '')
+        # ТЗ F-201: BoT-SORT's memory is counted in FRAMES, so the thirty
+        # seconds of re-association the ТЗ asks for are computed from the real
+        # frame rate instead of being left at the shipped default.
+        try:
+            self.tracker_path = write_tracker_config(
+                Path(__file__).with_name('room-tracker.runtime.yaml'),
+                self.fps or 10.0)
+        except Exception as exc:  # noqa: BLE001 - the shipped config still works
+            self.tracker_path = Path(__file__).with_name('room-tracker.yaml')
+            log.warning('Could not write the runtime tracker config (%s); using %s',
+                        exc, self.tracker_path.name)
         if _attr(self._recording_cfg, 'enabled', False):
             try:
                 from client.frame_recording import FrameRecorder
@@ -647,6 +834,15 @@ class CameraService:
                 continue
             last_frame_ts = frame_ts
             age = started - frame_ts
+            if not self.privacy.allows_frames:
+                # ТЗ F-303: пока камера «не смотрит», детектор не запускается
+                # вообще — ни людей, ни объектов, ни кропов.
+                self._track_reports = []
+                self._tracks = []
+                remaining = interval - (time.monotonic() - started)
+                if remaining > 0:
+                    self._stop_event.wait(remaining)
+                continue
             if frame is not None and age <= STALE_FRAME_S:
                 try:
                     persons, objects = self._detect(model, frame)
@@ -664,6 +860,8 @@ class CameraService:
                     self._inferred_count += 1
                     self._cache_detection(frame, frame_ts)
                     self._publish_state(persons, objects)
+                    self._publish_tracks()
+                    self._publish_body_crops(frame)
                     if persons >= 1:
                         if self._frame_recorder is not None:
                             self._frame_recorder.submit(frame, time.time() - (time.monotonic() - frame_ts),
@@ -676,21 +874,22 @@ class CameraService:
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def _detect(self, model: Any, frame: Any) -> Tuple[int, Dict[str, int]]:
+    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int]]:
         """Count people and objects in one frame by YOLO class name."""
-        from pathlib import Path
+        tracker = getattr(self, 'tracker_path', None) or str(
+            Path(__file__).with_name('room-tracker.yaml'))
         results = model.track(
             source=frame,
             persist=True,
-            tracker=str(Path(__file__).with_name('room-tracker.yaml')),
+            tracker=str(tracker),
             conf=CONF_THRESHOLD,
             verbose=False,
             device=0,
             imgsz=640,
             half=self.half,
         )
-        counts: Dict[str, int] = {}
-        tracks = []
+        counts: dict[str, int] = {}
+        detections = []
         for result in results or []:
             names = getattr(result, "names", None) or {}
             boxes = getattr(result, "boxes", None)
@@ -713,9 +912,17 @@ class CameraService:
                 label = str(names.get(index, index) if isinstance(names, dict) else index)
                 counts[label] = counts.get(label, 0) + 1
                 if label == 'person' and box_index < len(ids):
-                    tracks.append({'id': f'{self._track_epoch}:{int(ids[box_index])}',
-                                   'box': [max(0., min(1., float(v))) for v in positions[box_index]]})
-        self._tracks = tracks
+                    detections.append({
+                        'track_id': f'{self._track_epoch}:{int(ids[box_index])}',
+                        'bbox': [max(0., min(1., float(v))) for v in positions[box_index]],
+                        'conf': float(confidence),
+                    })
+        # ТЗ F-201: the registry keeps the id of a person who stepped out of
+        # the frame for thirty seconds, so coming back is a re-association.
+        self._track_reports = self.tracks.observe(detections, now=time.monotonic())
+        self._tracks = [{'id': report.track_id,
+                         'box': [float(value) for value in report.bbox]}
+                        for report in self._track_reports]
         persons = counts.pop("person", 0)
         return int(persons), counts
 
@@ -726,6 +933,12 @@ class CameraService:
             return
         stats = {'ts': time.time(), 'model': self.model_name, 'half': self.half,
                  'fps_limit': self.fps,
+                 # ТЗ F-312: чем закончился автовыбор профиля (пусто, если он
+                 # выключен) — видно и в логе, и в data/camera-performance.json.
+                 'profile': self.profile_name or None,
+                 'profile_latency_ms': self.profile_latency_ms,
+                 'profile_reason': self.profile_reason or None,
+                 'profile_attempts': list(self.profile_attempts),
                  'capture_fps': round((self._captured_count - self._metrics_captured) / elapsed, 2),
                  'yolo_fps': round((self._inferred_count - self._metrics_inferred) / elapsed, 2),
                  'captured_frames': self._captured_count, 'processed_frames': self._inferred_count,
@@ -745,7 +958,7 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_state (SPEC v1.4)
     # ------------------------------------------------------------------
-    def _publish_state(self, persons: int, objects: Dict[str, int]) -> None:
+    def _publish_state(self, persons: int, objects: dict[str, int]) -> None:
         """Send ``camera_state`` when the picture changed, at most every 2 s.
 
         YOLO flickers object counts (a bottle drifting between 1 and 2 across
@@ -753,6 +966,9 @@ class CameraService:
         A PERSON-count change is reported at once; an object-only change must
         stay identical for two consecutive checks before it is sent.
         """
+        if not self.privacy.allows_frames:
+            # ТЗ F-303: камера не смотрит — хабу нечего сообщать о комнате.
+            return
         # Change detection uses the person count and the SET of labels only:
         # YOLO endlessly flickers object counts (a bottle drifting between 1
         # and 2), and re-announcing every count change spammed the server every
@@ -789,7 +1005,7 @@ class CameraService:
         )
         self._submit(self._send_state(payload))
 
-    async def _send_state(self, payload: Dict[str, Any]) -> None:
+    async def _send_state(self, payload: dict[str, Any]) -> None:
         send_json = self._send_json
         if send_json is None:
             return
@@ -799,6 +1015,100 @@ class CameraService:
             raise
         except Exception as exc:  # noqa: BLE001 - a dead socket is normal here
             self._note_send_failure("camera_state", exc)
+            self._keep_for_replay(payload)
+
+    def _keep_for_replay(self, payload: Any) -> None:
+        """ТЗ 4.8: the frame never left the room — the client may replay it.
+
+        Only presence states are offered (the client's own buffer decides what
+        it keeps): the room is not going to hand five-minute-old pictures to
+        the hub, which would describe a past room as if it were the present.
+        """
+        callback = getattr(self, "_on_unsent", None)
+        if callback is None or not isinstance(payload, dict):
+            return
+        try:
+            callback(dict(payload))
+        except Exception as exc:  # noqa: BLE001 - a full buffer is not a crash
+            log.debug("Could not buffer the unsent %s (%s)", payload.get("type"), exc)
+
+    def _publish_tracks(self) -> None:
+        """ТЗ F-201: the room's own person tracks, in their own message.
+
+        The ids are what the hub reasons about ("the same person came back"),
+        so a changed SET of tracks is announced at once and the boxes are
+        refreshed with the same debounce the person count already uses. A
+        client that predates this message keeps sending ``camera_state``.
+        """
+        if not self._tracks_message:
+            return
+        if not self.privacy.allows_frames:
+            return
+        reports = list(getattr(self, '_track_reports', []))
+        ids = tuple(sorted(report.track_id for report in reports))
+        now = time.monotonic()
+        if ids == self._sent_track_ids and now - self._sent_tracks_at < STATE_DEBOUNCE_S:
+            return
+        self._sent_track_ids = ids
+        self._sent_tracks_at = now
+        for report in reports:
+            if report.event in {'entered', 'returned'}:
+                log.info('Track %s %s (gap %.1f s, %.0f%% conf)',
+                         report.track_id, report.event, report.gap_s, 100 * report.conf)
+        payload = {
+            "type": MSG_TRACKS,
+            "tracks": [report.as_wire() for report in reports],
+        }
+        self._submit(self._send_state(payload))
+
+    def _publish_body_crops(self, frame: Any) -> None:
+        """ТЗ F-202: cut a crop of every track that needs one right now.
+
+        Full height, at most 640 px tall, cut HERE - the hub never sees the
+        room's full frames unless it asks for one. Cut on appearance, every two
+        seconds and whenever the person turned (the box's aspect changed).
+        """
+        if not self._tracks_message or getattr(self, '_cv2', None) is None:
+            return
+        if not self.privacy.allows_frames:
+            return
+        now = time.monotonic()
+        for report in list(getattr(self, '_track_reports', [])):
+            x1, y1, x2, y2 = report.bbox
+            aspect = max(1e-6, abs(x2 - x1)) / max(1e-6, abs(y2 - y1))
+            if not self._crop_schedule.should_send(report.track_id, aspect, now=now):
+                continue
+            encoded = encode_crop(frame, report.bbox, self._cv2)
+            if encoded is None:
+                continue
+            jpeg, width, height = encoded
+            self._submit(self._send_body_crop(report.track_id, jpeg, width, height))
+
+    async def _send_body_crop(self, track_id: str, jpeg: bytes, width: int,
+                              height: int) -> None:
+        send_json, send_bytes = self._send_json, self._send_bytes
+        if send_json is None or send_bytes is None:
+            return
+        lock = self._send_lock
+        if lock is not None and lock.locked():
+            # The microphone is streaming: the server would read this JPEG as
+            # audio. The next two-second window carries the same person.
+            log.debug("Skipping a body crop - the socket is busy")
+            return
+        header = {"type": MSG_BODY_CROP, "track_id": track_id, "kind": "body",
+                  "w": int(width), "h": int(height)}
+        try:
+            if lock is None:
+                await send_json(header)
+                await send_bytes(jpeg)
+            else:
+                async with lock:
+                    await send_json(header)
+                    await send_bytes(jpeg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reconnects are routine
+            self._note_send_failure("body_crop", exc)
 
     # ------------------------------------------------------------------
     # camera_frame (SPEC v1.4)
@@ -810,6 +1120,9 @@ class CameraService:
         pending; its track boxes are captured together with its source frame.
         """
         now = time.monotonic()
+        if not self.privacy.allows_frames:
+            # ТЗ F-303: в приватном режиме не уходит даже «присутствие».
+            return
         if self._presence_pending.is_set() or now - self._last_presence_push < self.face_check_interval_s:
             return
         lock = self._send_lock
@@ -823,11 +1136,15 @@ class CameraService:
         self._last_presence_push = now
         self._frame_seq += 1
         frame_id = f'p{self._frame_seq}'
+        # ТЗ 4.5: an unprompted presence push is a background camera event too,
+        # so the client mints its own event id for the burst.
+        event_id = new_ulid()
         self._presence_pending.set()
-        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks))) is None:
+        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks),
+                                                       event_id)) is None:
             self._presence_pending.clear()
 
-    async def _encode_and_push_presence(self, frame, frame_id, tracks):
+    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id=''):
         try:
             # full=True: face recognition needs a CRISP face. The old 1280px /
             # quality-80 presence frame made the owner's own face score around
@@ -836,14 +1153,15 @@ class CameraService:
             pairs = ([await asyncio.to_thread(self._encode, frame, full=True)] if frame is not None
                      else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
             if pairs:
-                await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True, tracks=tracks)
+                await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True,
+                                       tracks=tracks, event_id=event_id)
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the thread
             log.debug("Could not capture the presence burst: %s", exc)
             return
         finally:
             self._presence_pending.clear()
 
-    def _encode(self, frame: Any, full: bool = False) -> Tuple[bytes, int, int]:
+    def _encode(self, frame: Any, full: bool = False) -> tuple[bytes, int, int]:
         """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80.
 
         :param full: v1.6 -- skip the downscale entirely for this frame
@@ -876,6 +1194,7 @@ class CameraService:
         pairs: list,
         skip_if_busy: bool = False,
         tracks=None,
+        event_id: str = "",
     ) -> None:
         """Send ``pairs`` as that many ``camera_frame`` header+binary pairs.
 
@@ -903,7 +1222,8 @@ class CameraService:
                     jpeg, width, height = pair[:3]
                     frame_tracks = pair[3] if len(pair) > 3 else tracks
                     await self._send_pair(
-                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
+                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
+                        frame_tracks, event_id
                     )
             else:
                 async with lock:
@@ -911,7 +1231,8 @@ class CameraService:
                         jpeg, width, height = pair[:3]
                         frame_tracks = pair[3] if len(pair) > 3 else tracks
                         await self._send_pair(
-                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
+                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
+                            frame_tracks, event_id
                         )
         except asyncio.CancelledError:
             raise
@@ -930,6 +1251,7 @@ class CameraService:
         width: int,
         height: int,
         tracks=None,
+        event_id: str = "",
     ) -> None:
         """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
@@ -943,6 +1265,10 @@ class CameraService:
             "of": int(total),
             "tracks": tracks,
         }
+        if event_id:
+            # ТЗ 4.5: the background camera event keeps the id the server minted
+            # (or the one this client minted for an unprompted presence push).
+            header["event_id"] = event_id
         log.debug(
             "Sending camera frame %s (%s) %d/%d: %dx%d, %d bytes",
             frame_id, reason, seq, total, width, height, len(jpeg),
@@ -956,9 +1282,10 @@ class CameraService:
         if send_json is None:
             return
         try:
-            await send_json(
-                {"type": MSG_CAMERA_ERROR, "id": str(request_id), "error": str(error)}
-            )
+            payload = {"type": MSG_CAMERA_ERROR, "id": str(request_id), "error": str(error)}
+            if self._request_event_id:
+                payload["event_id"] = self._request_event_id
+            await send_json(payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -976,7 +1303,8 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_request (SPEC v1.4)
     # ------------------------------------------------------------------
-    async def serve_request(self, request_id: str, burst: int = 1, full: bool = False) -> None:
+    async def serve_request(self, request_id: str, burst: int = 1, full: bool = False,
+                            event_id: str = "") -> None:
         """Answer the server's ``camera_request`` with ``burst`` frame(s) (v1.4 burst).
 
         Captures ``burst`` frames roughly :data:`BURST_FRAME_INTERVAL_S` apart,
@@ -999,8 +1327,15 @@ class CameraService:
         none for the server's best-face selection).
         """
         request_id = str(request_id or "")
+        # ТЗ 4.5: the server's event id is echoed on every header of the answer.
+        self._request_event_id = str(event_id or '')[:100]
         if not self._enabled:
             await self._send_error(request_id, "the camera is not available on this client")
+            return
+        if not self.privacy.allows_frames:
+            # ТЗ F-303: приватный режим — это не «нет кадров из-за ошибки», а
+            # прямое «камера выключена человеком»; ничего не снимаем и не шлём.
+            await self._send_error(request_id, "the camera is off (privacy mode)")
             return
         count = max(1, min(_as_int(burst, 1), CAMERA_BURST_MAX))
 
@@ -1024,10 +1359,11 @@ class CameraService:
             return
 
         log.info(
-            "Answering the camera request (id=%s): %d/%d frame(s)",
-            request_id or "?", len(pairs), count,
+            "Answering the camera request (id=%s, event %s): %d/%d frame(s)",
+            request_id or "?", self._request_event_id or "-", len(pairs), count,
         )
-        await self._send_burst(request_id, CAMERA_REASON_REQUEST, pairs)
+        await self._send_burst(request_id, CAMERA_REASON_REQUEST, pairs,
+                               event_id=self._request_event_id)
 
     # ------------------------------------------------------------------
     # thread -> event loop

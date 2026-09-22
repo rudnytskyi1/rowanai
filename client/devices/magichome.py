@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .base import STATE_OFF, Device, DeviceError, scale_rgb
 

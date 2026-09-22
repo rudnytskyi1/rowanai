@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-from ctypes import wintypes
-import json
-from pathlib import Path
-import re
 import time
+from ctypes import wintypes
+from pathlib import Path
 
 from . import pc
 

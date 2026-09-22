@@ -14,13 +14,13 @@ lead-in timeout (5 s by default, or the follow-up window), the recorder returns
 from __future__ import annotations
 
 import collections
-from array import array
 import inspect
 import logging
 import math
 import statistics
 import time
-from typing import Awaitable, Callable, Deque, List, Optional, Union
+from array import array
+from collections.abc import Awaitable, Callable
 
 try:
     import webrtcvad  # provided by the `webrtcvad-wheels` package on Windows
@@ -30,7 +30,7 @@ except ImportError as exc:  # pragma: no cover - depends on installation
         "dependencies: pip install -r client/requirements.txt"
     ) from exc
 
-from client.audio import SAMPLE_WIDTH, FRAME_MS
+from client.audio import FRAME_MS, SAMPLE_WIDTH
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +53,8 @@ DEFAULT_PRE_ROLL_MS = 300
 #: If the microphone stops delivering frames mid-utterance, give up after this.
 STALL_TIMEOUT_S = 3.0
 
-FrameReader = Callable[[], Awaitable[Optional[bytes]]]
-AudioSink = Callable[[bytes], Union[None, Awaitable[None]]]
+FrameReader = Callable[[], Awaitable[bytes | None]]
+AudioSink = Callable[[bytes], None | Awaitable[None]]
 
 
 class VadRecorder:
@@ -126,7 +126,7 @@ class VadRecorder:
         return 10 * math.log10(max(energy, 1e-6) / (32768 ** 2))
 
     @staticmethod
-    async def _emit(sink: Optional[AudioSink], data: bytes) -> None:
+    async def _emit(sink: AudioSink | None, data: bytes) -> None:
         if sink is None or not data:
             return
         result = sink(data)
@@ -138,9 +138,9 @@ class VadRecorder:
         self,
         read_frame: FrameReader,
         pre_roll: bytes = b"",
-        lead_in_s: Optional[float] = None,
-        on_audio: Optional[AudioSink] = None,
-    ) -> Optional[bytes]:
+        lead_in_s: float | None = None,
+        on_audio: AudioSink | None = None,
+    ) -> bytes | None:
         """Record one utterance.
 
         ``read_frame`` is awaited repeatedly and must return a chunk of PCM
@@ -156,13 +156,13 @@ class VadRecorder:
         lead_in = self.lead_in_s if lead_in_s is None else float(lead_in_s)
         # The user always gets at least MIN_LEAD_IN_S to start talking.
         lead_in = max(MIN_LEAD_IN_S, lead_in)
-        base_roll: List[bytes] = [pre_roll] if pre_roll else []
-        collected: List[bytes] = list(base_roll)
+        base_roll: list[bytes] = [pre_roll] if pre_roll else []
+        collected: list[bytes] = list(base_roll)
         # Frames captured before speech starts: a bounded ring, so a long lead-in
         # (5 s, or followup_window_s) is not prepended to the utterance.
-        lead_in_ring: Deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
+        lead_in_ring: collections.deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
         pending = b""
-        window: Deque[bool] = collections.deque(maxlen=self.onset_window)
+        window: collections.deque[bool] = collections.deque(maxlen=self.onset_window)
         started = False
         finished = False
         silence_limit = max(1, int(round(self.silence_ms / self.frame_ms)))
@@ -171,7 +171,7 @@ class VadRecorder:
         # (webcam AGC, TV hum) reset the counter over and over, stretching the
         # 0.8 s tail into many seconds. Instead the utterance ends when at most
         # 10% of the last silence_ms worth of frames were flagged as speech.
-        tail: Deque[bool] = collections.deque(maxlen=silence_limit)
+        tail: collections.deque[bool] = collections.deque(maxlen=silence_limit)
         tail_allowed_speech = max(0, int(silence_limit * 0.1))
         # Nothing is streamed to the server until min_speech_frames voiced frames
         # have been seen. A "recording" that ends before that is a noise blip: it
@@ -183,8 +183,8 @@ class VadRecorder:
         speech_started_at = 0.0
         recorded_frames = 0
         max_frames = max(1, int(math.ceil(self.max_utterance_s * 1000 / self.frame_ms)))
-        levels: Deque[float] = collections.deque(maxlen=max(3, int(round(300 / self.frame_ms))))
-        level_speech: Deque[bool] = collections.deque(maxlen=levels.maxlen)
+        levels: collections.deque[float] = collections.deque(maxlen=max(3, int(round(300 / self.frame_ms))))
+        level_speech: collections.deque[bool] = collections.deque(maxlen=levels.maxlen)
         speech_level = None
         now = time.monotonic()
         deadline = now + lead_in
@@ -308,7 +308,7 @@ class VadRecorder:
     async def wait_for_speech(self, read_frame: FrameReader, timeout_s: float) -> bool:
         """True if speech starts within ``timeout_s`` (frames are consumed)."""
         deadline = time.monotonic() + max(0.0, float(timeout_s))
-        window: Deque[bool] = collections.deque(maxlen=self.onset_window)
+        window: collections.deque[bool] = collections.deque(maxlen=self.onset_window)
         pending = b""
         while time.monotonic() < deadline:
             chunk = await read_frame()

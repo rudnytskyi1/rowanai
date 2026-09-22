@@ -15,7 +15,8 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -232,7 +233,7 @@ def scale_rgb(rgb: Sequence[int], brightness: int | None) -> tuple[int, int, int
 # --- device base class -------------------------------------------------------
 
 
-class Device(ABC):
+class Device(ABC):  # noqa: B024 - subclasses only override type_name and params by convention
     """A controllable device configured in ``cfg.client.devices`` (SPEC §6).
 
     Type-specific settings arrive through ``params`` (everything in the YAML

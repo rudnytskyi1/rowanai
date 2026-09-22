@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
 import tempfile
-from urllib.parse import urlsplit
-from urllib.request import urlopen
 import uuid
 import zipfile
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 import yaml
 

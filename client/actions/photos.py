@@ -1,11 +1,11 @@
 """Save a verified image to the Windows Desktop and optionally open it."""
 import base64
 import ctypes
+import os
+import re
 from datetime import datetime
 from io import BytesIO
-import os
 from pathlib import Path
-import re
 
 from PIL import Image
 

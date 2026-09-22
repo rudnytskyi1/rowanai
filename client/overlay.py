@@ -72,7 +72,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -219,7 +219,7 @@ def _clamp01(value: Any) -> float:
     return number
 
 
-def norm_to_px(x_norm: Any, y_norm: Any, width: int, height: int) -> Tuple[int, int]:
+def norm_to_px(x_norm: Any, y_norm: Any, width: int, height: int) -> tuple[int, int]:
     """Map normalized ``(0..1, 0..1)`` screen coordinates to clamped pixel ints.
 
     Out-of-range values are clamped rather than rejected (a slightly
@@ -284,7 +284,7 @@ class OverlayHUD:
         self.chroma = str(_attr(cfg, "chroma", DEFAULT_CHROMA) or DEFAULT_CHROMA)
 
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._ready_event = threading.Event()
         self._warned = False
 
@@ -301,6 +301,13 @@ class OverlayHUD:
         # window; the actual look/animation lives entirely in hud.html/css).
         self._state = STATE_IDLE
         self._status = ""
+        #: Persistent capability warning (ТЗ F-102: barge-in without AEC).
+        self._warning = ""
+        #: ТЗ F-303: the camera is off (privacy mode) — a permanent badge, not
+        #: a passing status: the room must be able to see it at a glance.
+        self._camera_off = ""
+        #: When the follow-up window stops listening (ТЗ F-103), 0 when closed.
+        self._followup_until = 0.0
         #: Name currently shown centred on screen (v1.7), "" when none.
         self._speaker_name = ""
         self._scanning = False
@@ -390,6 +397,51 @@ class OverlayHUD:
         truncated = _truncate_status(text)
         self._post(lambda bridge: bridge.status_changed.emit(truncated))
 
+    def barge_in_warning(self, text: Any) -> None:
+        """A capability warning that STAYS on the HUD (ТЗ F-102).
+
+        ``set_status`` is a caption: it belongs to a moment and fades away with
+        it. The missing echo canceller is not a moment — it is why the room
+        cannot interrupt Rowan, and the owner has to be able to see it. So the
+        line rides in every state snapshot the page receives and stays until it
+        is cleared with an empty string.
+        """
+        if not self.enabled:
+            return
+        self._warning = _truncate_status(text)
+        self._post(lambda bridge: bridge.warning_changed.emit(self._warning))
+
+    def camera_privacy(self, text: Any) -> None:
+        """The «camera off» badge of ТЗ F-303; an empty string clears it.
+
+        Privacy is not a moment and not a status: while it lasts the room is
+        not being watched, and that has to stay visible. The badge therefore
+        rides in every state snapshot next to the capability warning.
+        """
+        if not self.enabled:
+            return
+        self._camera_off = _truncate_status(text)
+        self._post(lambda bridge: bridge.camera_changed.emit(self._camera_off))
+
+    def followup_window(self, seconds: Any) -> None:
+        """Show the follow-up window draining (ТЗ F-103); ``0`` closes it.
+
+        The window is audible only because the room knows about it: people say
+        "why did it stop listening?" when nothing on screen changes. So the
+        HUD draws the remaining seconds as a small ring under the glow, and
+        the client closes it the moment the window stops listening - the
+        indicator never outlives the microphone.
+        """
+        if not self.enabled:
+            return
+        try:
+            window = max(0.0, min(30.0, float(seconds)))
+        except (TypeError, ValueError):
+            log.debug("Ignoring a follow-up window of %r", seconds)
+            return
+        self._followup_until = time.monotonic() + window if window else 0.0
+        self._post(lambda bridge: bridge.followup_changed.emit(window))
+
     def scan_screen(self, on: bool = True) -> None:
         """Toggle the soft screen-scan sweep (while a screenshot/vision call is in flight)."""
         if not self.enabled:
@@ -450,6 +502,21 @@ class OverlayHUD:
 
     def transcript(self, payload: dict) -> None:
         self._post(lambda bridge: bridge.transcript_changed.emit(json.dumps(payload)))
+
+    def hub_state(self, payload: dict) -> None:
+        """ТЗ F-708: статус хаба (online / queue / offline) на экране комнаты."""
+        self._post(lambda bridge: bridge.hub_changed.emit(json.dumps(payload)))
+
+    def tracks(self, payload: Any) -> None:
+        """ТЗ F-708: имена над треками поверх показанного кадра.
+
+        ``payload`` — либо список ``[{name, box}]``, либо объект
+        ``{"tracks": [...], "w": int, "h": int}`` с размерами самого кадра:
+        полноэкранный снимок держит пропорции, и по этим числам страница сама
+        считает, где именно лежит кадр, чтобы подписи встали на людей.
+        """
+        self._post(lambda bridge: bridge.tracks_changed.emit(
+            json.dumps(payload if payload is not None else [])))
 
     def photo(self, jpeg: bytes) -> None:
         import base64
@@ -535,7 +602,7 @@ class OverlayHUD:
         finally:
             self._teardown_qt()
 
-    def _create_qt_objects(self) -> Tuple[Any, Any, Any]:
+    def _create_qt_objects(self) -> tuple[Any, Any, Any]:
         """Import PySide6 and build the QApplication + transparent WebView + bridge.
 
         Only ever called from :meth:`_run_ui` on the dedicated Qt thread,
@@ -550,8 +617,8 @@ class OverlayHUD:
         # created (a documented Qt/PySide6 requirement), so this import
         # happens before QApplication(...) below, not just before it is used.
         from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-        from PySide6.QtWidgets import QApplication, QMessageBox
         from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWidgets import QApplication, QMessageBox
 
         owner = self
 
@@ -566,6 +633,9 @@ class OverlayHUD:
 
             state_changed = Signal(str)
             status_changed = Signal(str)
+            warning_changed = Signal(str)
+            camera_changed = Signal(str)
+            followup_changed = Signal(float)
             scan_changed = Signal(bool)
             typing_changed = Signal(bool)
             click_requested = Signal(float, float)
@@ -576,6 +646,8 @@ class OverlayHUD:
             chat_changed = Signal(str)
             reply_changed = Signal(str)
             transcript_changed = Signal(str)
+            hub_changed = Signal(str)
+            tracks_changed = Signal(str)
             photo_changed = Signal(str)
             capture_requested = Signal(object)
             capture_finished = Signal()
@@ -586,6 +658,9 @@ class OverlayHUD:
                 super().__init__()
                 self.state_changed.connect(self._on_state)
                 self.status_changed.connect(self._on_status)
+                self.warning_changed.connect(self._on_warning)
+                self.camera_changed.connect(self._on_camera)
+                self.followup_changed.connect(self._on_followup)
                 self.scan_changed.connect(self._on_scan)
                 self.typing_changed.connect(self._on_typing)
                 self.click_requested.connect(self._on_click)
@@ -596,12 +671,15 @@ class OverlayHUD:
                 self.chat_changed.connect(self._on_chat)
                 self.reply_changed.connect(self._on_reply)
                 self.transcript_changed.connect(self._on_transcript)
+                self.hub_changed.connect(self._on_hub)
+                self.tracks_changed.connect(self._on_tracks)
                 self.photo_changed.connect(self._on_photo)
                 self.capture_requested.connect(self._on_capture)
                 self.capture_finished.connect(self._on_capture_finished)
                 self.voice_confirmation.connect(self._on_voice_confirmation)
                 self.voice_confirmation_cancel.connect(self._cancel_voice_confirmation)
                 self._voice_box = None
+                self._followup_timer = None
 
             def _cancel_voice_confirmation(self):
                 if self._voice_box is not None:
@@ -666,6 +744,8 @@ class OverlayHUD:
                     {
                         "state": owner._state,
                         "status": owner._status,
+                        "warning": owner._warning,
+                        "camera_off": owner._camera_off,
                         "typing": owner._typing_on,
                         "scan": owner._scanning,
                     }
@@ -676,7 +756,7 @@ class OverlayHUD:
                 now = time.monotonic()
                 return _is_active(
                     owner._state,
-                    owner._status or owner._speaker_name,
+                    owner._status or owner._speaker_name or owner._warning or owner._camera_off,
                     owner._scanning,
                     owner._typing_on,
                     now < owner._flash_until,
@@ -724,6 +804,12 @@ class OverlayHUD:
             def _on_transcript(self, payload: str) -> None:
                 self._run_js(f"window.hudTranscript && window.hudTranscript({payload});")
 
+            def _on_hub(self, payload: str) -> None:
+                self._run_js(f"window.hudHub && window.hudHub({payload});")
+
+            def _on_tracks(self, payload: str) -> None:
+                self._run_js(f"window.hudTracks && window.hudTracks({payload});")
+
             def _on_photo(self, url: str) -> None:
                 self._run_js(f"window.hudImage && window.hudImage({json.dumps(url)});")
 
@@ -746,6 +832,47 @@ class OverlayHUD:
                 owner._status = text
                 self._sync_state()
                 self._reconsider_visibility()
+
+            def _on_warning(self, text: str) -> None:
+                owner._warning = text
+                self._sync_state()
+                self._reconsider_visibility()
+
+            def _on_camera(self, text: str) -> None:
+                """ТЗ F-303: the camera-off badge, shown until it is cleared."""
+                owner._camera_off = text
+                self._sync_state()
+                self._reconsider_visibility()
+
+            def _on_followup(self, seconds: float) -> None:
+                """Draw the window draining, one tick per quarter second."""
+                self._stop_followup_timer()
+                if seconds <= 0:
+                    owner._followup_until = 0.0
+                    self._run_js("window.hudFollowup && window.hudFollowup(0);")
+                    return
+                owner._followup_until = time.monotonic() + seconds
+                self._run_js(f"window.hudFollowup && window.hudFollowup({seconds:.2f});")
+                timer = QTimer()
+                timer.setInterval(250)
+                timer.timeout.connect(self._tick_followup)
+                timer.start()
+                self._followup_timer = timer
+
+            def _stop_followup_timer(self) -> None:
+                timer, self._followup_timer = getattr(self, "_followup_timer", None), None
+                if timer is not None:
+                    try:
+                        timer.stop()
+                    except Exception:  # noqa: BLE001 - a closing page must not raise
+                        log.debug("overlay: could not stop the follow-up timer", exc_info=True)
+
+            def _tick_followup(self) -> None:
+                left = max(0.0, owner._followup_until - time.monotonic())
+                self._run_js(f"window.hudFollowup && window.hudFollowup({left:.2f});")
+                if left <= 0:
+                    owner._followup_until = 0.0
+                    self._stop_followup_timer()
 
             def _on_scan(self, on: bool) -> None:
                 owner._scanning = on
@@ -791,6 +918,7 @@ class OverlayHUD:
 
             def _on_stop(self) -> None:
                 self._cancel_voice_confirmation()
+                self._stop_followup_timer()
                 try:
                     if owner._view is not None:
                         owner._view.close()

@@ -18,7 +18,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Deque, Optional, Union
+from typing import Union
 
 import numpy as np
 import sounddevice as sd
@@ -81,7 +81,7 @@ class RingBuffer:
     """Fixed-length ring of audio frames used for the pre-roll (SPEC §7 step 3)."""
 
     def __init__(self, max_frames: int) -> None:
-        self._frames: Deque[bytes] = collections.deque(maxlen=max(0, int(max_frames)))
+        self._frames: collections.deque[bytes] = collections.deque(maxlen=max(0, int(max_frames)))
 
     def push(self, frame: bytes) -> None:
         self._frames.append(frame)
@@ -112,8 +112,8 @@ class AudioInput:
         self.frame_ms = int(frame_ms)
         self.blocksize = frame_samples(self.sample_rate, self.frame_ms)
         self.frame_bytes = self.blocksize * SAMPLE_WIDTH
-        self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=max(10, int(max_queue_frames)))
-        self._stream: Optional[sd.RawInputStream] = None
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=max(10, int(max_queue_frames)))
+        self._stream: sd.RawInputStream | None = None
         self._dropped = 0
         self._processor = processor
         self._raw_queue = queue.Queue(maxsize=8)
@@ -228,6 +228,11 @@ class AudioInput:
     def running(self) -> bool:
         return self._stream is not None
 
+    @property
+    def processor(self):
+        """The local DSP stage, or ``None`` (ТЗ F-102 reads its ``aec_active``)."""
+        return self._processor
+
     def clear(self) -> None:
         """Drop everything captured so far (echo of our own playback, etc.)."""
         self._generation += 1
@@ -237,19 +242,19 @@ class AudioInput:
             except queue.Empty:
                 return
 
-    def read_frame_nowait(self) -> Optional[bytes]:
+    def read_frame_nowait(self) -> bytes | None:
         try:
             return self._queue.get_nowait()
         except queue.Empty:
             return None
 
-    def _get_blocking(self, timeout: float) -> Optional[bytes]:
+    def _get_blocking(self, timeout: float) -> bytes | None:
         try:
             return self._queue.get(True, timeout)
         except queue.Empty:
             return None
 
-    async def read_frame(self, timeout: float = 0.5) -> Optional[bytes]:
+    async def read_frame(self, timeout: float = 0.5) -> bytes | None:
         """Await one captured frame; ``None`` if nothing arrived within ``timeout``."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._get_blocking, float(timeout))
@@ -261,11 +266,11 @@ class AudioOutput:
     def __init__(self, device: DeviceSpec = None, default_sample_rate: int = 16000) -> None:
         self.device = device
         self.default_sample_rate = int(default_sample_rate)
-        self._stream: Optional[sd.RawOutputStream] = None
-        self._declared_rate: Optional[int] = None   # rate of the PCM we are handed
-        self._device_rate: Optional[int] = None     # rate the device actually runs at
-        self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
-        self._writer: Optional[asyncio.Task] = None
+        self._stream: sd.RawOutputStream | None = None
+        self._declared_rate: int | None = None   # rate of the PCM we are handed
+        self._device_rate: int | None = None     # rate the device actually runs at
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._writer: asyncio.Task | None = None
         self._tail = b""
 
     # -- stream management ----------------------------------------------
@@ -312,7 +317,7 @@ class AudioOutput:
         self._ensure_writer()
         log.debug("Audio output open: %d Hz (device at %d Hz)", samplerate, device_rate)
 
-    def _device_default_rate(self) -> Optional[float]:
+    def _device_default_rate(self) -> float | None:
         try:
             info = sd.query_devices(self.device, "output")
             return float(info["default_samplerate"])
@@ -395,6 +400,38 @@ class AudioOutput:
             self._queue.task_done()
             dropped += 1
         self._tail = b""
+        return dropped
+
+    def abort(self) -> int:
+        """Go silent NOW: drop the queue *and* the device's own buffer (F-102).
+
+        ``cancel_pending`` empties the queue, but the audio device still holds
+        whatever PortAudio already accepted — with a 100 ms device block that
+        is another 100 ms of speech after the person started interrupting. The
+        ТЗ 15.1 budget for barge-in is 200 ms, so the stream itself is aborted
+        (which discards the queued device buffer) instead of stopped politely.
+
+        The stream is then dropped, so the next reply reopens it — reopening is
+        an output concern of that reply, not of the interruption.
+        """
+        dropped = self.cancel_pending()
+        stream, self._stream = self._stream, None
+        self._declared_rate = None
+        self._device_rate = None
+        if stream is None:
+            return dropped
+        abort = getattr(stream, "abort", None)
+        try:
+            if callable(abort):
+                abort()
+            else:  # pragma: no cover - a stream stub without abort()
+                stream.stop()
+        except Exception as exc:  # pragma: no cover - device teardown
+            log.debug("Error while aborting the audio output: %s", exc)
+        try:
+            stream.close()
+        except Exception as exc:  # pragma: no cover - device teardown
+            log.debug("Error while closing the aborted audio output: %s", exc)
         return dropped
 
     async def drain(self) -> None:

@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import math
-from pathlib import Path
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 from common.protocol import CAMERA_CLIP_MAX_BYTES, MSG_CAMERA_CLIP, MSG_CAMERA_CLIP_ERROR
 
@@ -85,14 +85,18 @@ def record_clip(camera, seconds=5, fps=8, *, cancel=None):
         camera._clip_lock.release()
 
 
-async def serve_clip(camera, request_id, seconds=5, fps=8):
+async def serve_clip(camera, request_id, seconds=5, fps=8, event_id=''):
     """Capture without holding the socket; hold its wire lock for header+MP4."""
     request_id = str(request_id or '')[:100]
+    event_id = str(event_id or '')[:100]
     cancel = threading.Event()
     try:
         result = await asyncio.to_thread(record_clip, camera, seconds, fps, cancel=cancel)
         header = dict(type=MSG_CAMERA_CLIP, id=request_id, format='mp4', bytes=len(result['data']),
                       **{key: result[key] for key in ('w', 'h', 'seconds', 'fps')})
+        if event_id:
+            # ТЗ 4.5: the clip is the answer to one background camera event.
+            header['event_id'] = event_id
 
         async def send():
             await camera._send_json(header)
@@ -111,4 +115,7 @@ async def serve_clip(camera, request_id, seconds=5, fps=8):
         error = str(exc) if isinstance(exc, (ValueError, RuntimeError)) and str(exc).startswith(
             ('Clip ', 'The camera ', 'The video ', 'Camera ', 'MP4 ', 'Another ')) else 'Camera clip capture failed.'
         if camera._send_json is not None:
-            await camera._send_json(dict(type=MSG_CAMERA_CLIP_ERROR, id=request_id, error=error))
+            failure = dict(type=MSG_CAMERA_CLIP_ERROR, id=request_id, error=error)
+            if event_id:
+                failure['event_id'] = event_id
+            await camera._send_json(failure)

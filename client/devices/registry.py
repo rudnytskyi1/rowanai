@@ -11,7 +11,8 @@ skipped — one bad line in ``config.yaml`` must not stop the whole assistant.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from typing import Any
 
 from .base import Device, DeviceError, normalize_name
 from .magichome import MagicHomeDevice

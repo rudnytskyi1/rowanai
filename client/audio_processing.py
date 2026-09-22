@@ -6,10 +6,10 @@ Processing runs in AudioInput's worker, never in the microphone callback.
 """
 from __future__ import annotations
 
-from collections import deque
 import logging
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -168,6 +168,11 @@ class AudioPreprocessor:
         self.timeline = ReferenceTimeline(rate)
         self.reference = None
         self.processor = None
+        #: True only while WebRTC echo cancellation is actually running.
+        #: Barge-in (ТЗ F-102) is switched on from this measured value, never
+        #: from the config wish: a client whose loopback reference failed must
+        #: not start cutting its own replies short.
+        self.aec_active = False
         self.frames = 0
         self.processing_ms = 0.0
         self.levels = AudioLevelWindow()
@@ -189,6 +194,7 @@ class AudioPreprocessor:
             noise_suppression=self.noise_suppression, ns_level=self.ns_level,
             high_pass_filter=True, auto_gain_control=False,
         )
+        self.aec_active = bool(aec and self.reference is not None)
         log.info('Local audio processing ready: echo=%s, noise=%s, AGC=off', aec, self.noise_suppression)
 
     def process(self, pcm: bytes, started: float) -> bytes:
@@ -216,3 +222,4 @@ class AudioPreprocessor:
             self.reference.close()
             self.reference = None
         self.processor = None
+        self.aec_active = False

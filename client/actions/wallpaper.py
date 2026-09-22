@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import os
+import tempfile
 from ctypes import wintypes
 from hashlib import sha256
 from io import BytesIO
-import os
 from pathlib import Path
-import tempfile
 
 from PIL import Image
-
 
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000

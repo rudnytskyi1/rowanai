@@ -29,7 +29,7 @@ import io
 import logging
 import sys
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ def _ensure_dpi_aware() -> None:
             pass
 
 
-def _load_pillow() -> Tuple[Any, Any]:
+def _load_pillow() -> tuple[Any, Any]:
     """Import Pillow lazily so a missing dependency cannot break client startup."""
     try:
         from PIL import Image, ImageGrab  # type: ignore

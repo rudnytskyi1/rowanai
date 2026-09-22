@@ -28,7 +28,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -239,8 +239,8 @@ class ImageViewer:
     def __init__(self) -> None:
         self._cv2: Any = None
         self._cv2_checked = False
-        self._queue: "queue.Queue[Any]" = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         with _viewers_lock:
             _viewers.add(self)
@@ -356,7 +356,7 @@ class ImageViewer:
     def _run(self) -> None:
         """The window/message-pump loop — the ONLY thread that touches cv2's UI."""
         cv2 = self._cv2
-        shown_deadline: Optional[float] = None
+        shown_deadline: float | None = None
         try:
             while True:
                 timeout = POLL_S if shown_deadline is not None else None

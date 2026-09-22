@@ -1,5 +1,6 @@
 """Explicit voice controls with bounded recovery for conversational hesitation."""
 import re
+from collections.abc import Iterable
 
 SILENCE_PHRASES = frozenset({
     'shut up', 'stop talking', 'stop speaking', 'be quiet',
@@ -35,11 +36,11 @@ _RECOVERED_SILENCE = re.compile(
 )
 
 
-def normalize(text):
+def normalize(text: object) -> str:
     return ' '.join(re.sub(r'[^\w\s]', ' ', str(text).casefold()).split())
 
 
-def is_silence_command(text):
+def is_silence_command(text: object) -> bool:
     # Keep quoted commands as a nonmatching token instead of turning a quote
     # into a real command by stripping punctuation. Apostrophes in "that's"
     # and "don't" are not quote delimiters.
@@ -49,12 +50,12 @@ def is_silence_command(text):
     return _RECOVERED_SILENCE.fullmatch(text) is not None
 
 
-def mentions_silence_command(text):
+def mentions_silence_command(text: object) -> bool:
     text = ' ' + normalize(text) + ' '
     return any(' ' + phrase + ' ' in text for phrase in SILENCE_PHRASES)
 
 
-def has_wake_prefix(text: str, phrases=()) -> bool:
+def has_wake_prefix(text: str, phrases: Iterable[str] = ()) -> bool:
     """Confirm a local wake trigger in STT without treating 'bro' as Rowan."""
     text = _QUOTED_TEXT.sub(' quoted speech ', str(text)).casefold().replace('’', "'")
     # Contractions are one spoken word: "But why don't do it Rowan" must not

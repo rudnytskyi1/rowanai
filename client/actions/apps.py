@@ -40,8 +40,9 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 log = logging.getLogger(__name__)
 

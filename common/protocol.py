@@ -33,6 +33,9 @@ Client -> Server
   format: "mp4", bytes, w, h, seconds, fps}`` followed by one silent MP4 binary
   frame of at most CAMERA_CLIP_MAX_BYTES, or ``{type: MSG_CAMERA_CLIP_ERROR,
   id, error}`` with no binary. Header and MP4 share the client's wire lock.
+* ``{"type": MSG_TTS_PREFETCH, "phrases": [{"id": str, "text": str}]}`` (ТЗ 4.8)
+  asks for the fixed lines the room must be able to SAY with the hub gone; the
+  hub answers with one MSG_TTS_PHRASE header + binary PCM per phrase.
 
 Server -> Client
 ----------------
@@ -54,6 +57,16 @@ Server -> Client
 * ``{type: MSG_CAMERA_CLIP_REQUEST, id, seconds: 3..10, fps: 5..10}`` is sent
   only when the client advertises ``camera_clip``. Recording uses existing
   camera capture frames; it does not open another camera or run extra YOLO.
+* ``{"type": MSG_SOUND_EVENT, "label": str, "conf": 0..1, "at_ms": int}`` --
+  v2 (ТЗ F-109): one sound the client's own detector heard (knock, bell,
+  alarm, breaking glass, cough). No audio leaves the room; the hub turns the
+  label into an alert-rule event (F-702).
+* ``{"type": MSG_OFFLINE_HINT, "reason": str, "eta_s": float}`` (ТЗ 4.8) -- the
+  hub is going away on purpose (restart, maintenance), so the client switches
+  to its local mode before the socket breaks.
+* ``{"type": MSG_TTS_PHRASE, "id": str, "rate": int, "bytes": int}`` (ТЗ 4.8)
+  followed by exactly ONE binary frame with the PCM of that fixed line; a line
+  the hub could not synthesize comes back with ``error`` and no binary frame.
 * ``{"type": MSG_SAY, "text": str, "listen_s": float, "status": str}`` --
   ``listen_s`` and ``status`` are optional. v1.7: ``status`` is a caption the
   client shows on the HUD for the follow-up window this reply opens (voice
@@ -95,6 +108,13 @@ is likewise always followed by exactly one binary frame.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Mapping
+from enum import Enum
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
 # --- client -> server -------------------------------------------------------
 MSG_HELLO = "hello"
 #: Idle local VAD heartbeat, no audio/transcript: defer unsolicited greetings.
@@ -110,6 +130,18 @@ MSG_SCREENSHOT = "screenshot"
 MSG_SCREENSHOT_ERROR = "screenshot_error"
 #: v1.4: what the room camera currently sees (people count + object counts).
 MSG_CAMERA_STATE = "camera_state"
+#: v2 (ТЗ F-109): one sound event the client's own detector heard (knock, bell,
+#: alarm, breaking glass, cough). The hub turns it into an alert-rule event
+#: (F-702); the client never sends audio for it, only the label and confidence.
+MSG_SOUND_EVENT = "sound_event"
+#: v2 (ТЗ F-201): the live person TRACKS of one client - each person in the
+#: frame keeps its ``track_id`` while it is visible, and a lost track is
+#: remembered for up to 30 s so the same person comes back as the same track.
+#: ``camera_state`` keeps carrying its count for a client that predates this.
+MSG_TRACKS = "tracks"
+#: v2 (ТЗ F-202): header announcing ONE binary frame with a person's body
+#: crop - JPEG, up to 640 px tall, cut on the client for ReID (F-203).
+MSG_BODY_CROP = "body_crop"
 #: v1.4: header announcing the single binary frame with a camera JPEG.
 MSG_CAMERA_FRAME = "camera_frame"
 #: v1.4: the client could not grab a camera frame; no binary frame follows.
@@ -129,6 +161,15 @@ MSG_SCREENSHOT_REQUEST = "screenshot_request"
 #: v1.4: ask the client for one frame of the room camera.
 MSG_CAMERA_REQUEST = "camera_request"
 MSG_CAMERA_CLIP_REQUEST = "camera_clip_request"
+#: v1.8 (ТЗ F-303): the room's camera goes (or comes) back — the client stops
+#: sending frames and shows the indicator; the microphone keeps working, so the
+#: same voice can ask for the camera back.
+MSG_PRIVACY = "privacy"
+#: v2 (ТЗ 4.8): the hub is going away on purpose (restart, maintenance). The
+#: client switches to its local mode at once instead of waiting for the socket
+#: to break, so the room is told what is happening while the brain is still
+#: there to say it.
+MSG_OFFLINE_HINT = "offline_hint"
 MSG_SAY = "say"
 MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
@@ -138,12 +179,42 @@ MSG_IMAGE_SHOW = "image_show"
 #: shown on the HUD while something slow happens in the background (face
 #: enrollment photos). Empty text clears it. Nothing is spoken.
 MSG_STATUS = "status"
+#: v2 (ТЗ F-708): what the brain itself is doing, for the room HUD --
+#: ``{"state": "online" | "queue" | "offline", "queue": int}``. The hub sends
+#: it when a room connects and when the GPU queue picks up or finishes work;
+#: ``offline`` is normally the CLIENT's own conclusion when the socket is gone,
+#: so the HUD never has to guess whether the room or the brain is the problem.
+MSG_HUB_STATUS = "hub_status"
+#: v2 (ТЗ 4.8): "synthesize these fixed lines and send me the audio". The
+#: client asks for the phrases it must be able to SAY while the hub is gone
+#: (there is no TTS on a room PC), and keeps the PCM it gets back.
+MSG_TTS_PREFETCH = "tts_prefetch"
+#: v2 (ТЗ 4.8): the answer to ``MSG_TTS_PREFETCH`` - one header naming the
+#: phrase and its rate, followed by ONE binary frame with the PCM. A phrase the
+#: hub could not synthesize comes back with ``error`` and no audio, so the
+#: client never plays silence as if it were a cached line.
+MSG_TTS_PHRASE = "tts_phrase"
 #: v1.7: who the server just recognised by voice, ``{"name": str, "score":
 #: float}``. Sent right after identification, before the reply is produced, so
 #: the HUD can show the name while the person is still looking at it. An empty
 #: name clears it; a voice that matched nobody is simply not announced.
 MSG_SPEAKER = "speaker"
 MSG_ERROR = "error"
+#: v2: the room's settings changed on the hub (``config_update``, ТЗ 4.7).
+MSG_CONFIG_UPDATE = "config_update"
+
+#: Hub -> client frames of the background class (ТЗ 13): when a client cannot
+#: keep up with the send queue, these are dropped first. A reply's text and its
+#: PCM chunks are never in this set.
+BACKGROUND_SERVER_MESSAGE_TYPES = frozenset(
+    {"camera_state", "camera_frame", "device_state", "hud", "status", "speaker",
+     "hub_status", "offline_hint"}
+)
+
+
+def is_background_server_frame(payload: Mapping[str, Any]) -> bool:
+    """True when a hub -> client frame may be dropped under backpressure."""
+    return str(payload.get("type", "")) in BACKGROUND_SERVER_MESSAGE_TYPES
 
 #: v1.7: optional ``say`` field - a caption the client shows on the HUD for the
 #: follow-up window that reply opens (voice enrollment progress), so the person
@@ -208,10 +279,13 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_SCREENSHOT,
         MSG_SCREENSHOT_ERROR,
         MSG_CAMERA_STATE,
+        MSG_TRACKS,
+        MSG_BODY_CROP,
         MSG_CAMERA_FRAME,
         MSG_CAMERA_ERROR,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
+        MSG_TTS_PREFETCH,
     }
 )
 
@@ -236,13 +310,18 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_SCREENSHOT_REQUEST,
         MSG_CAMERA_REQUEST,
         MSG_CAMERA_CLIP_REQUEST,
+        MSG_PRIVACY,
         MSG_SAY,
         MSG_TTS_START,
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
         MSG_STATUS,
+        MSG_HUB_STATUS,
         MSG_SPEAKER,
+        MSG_OFFLINE_HINT,
+        MSG_TTS_PHRASE,
         MSG_ERROR,
+        MSG_CONFIG_UPDATE,
     }
 )
 
@@ -260,11 +339,18 @@ __all__ = [
     "MSG_SCREENSHOT",
     "MSG_SCREENSHOT_ERROR",
     "MSG_CAMERA_STATE",
+    "MSG_TRACKS",
+    "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_ERROR",
     "MSG_CAMERA_CLIP",
     "MSG_CAMERA_CLIP_ERROR",
     "MSG_CAMERA_CLIP_REQUEST",
+    "MSG_SOUND_EVENT",
+    "MSG_PRIVACY",
+    "MSG_OFFLINE_HINT",
+    "MSG_TTS_PREFETCH",
+    "MSG_TTS_PHRASE",
     "CAP_CAMERA_CLIP",
     "CAMERA_CLIP_MAX_BYTES",
     "MSG_READY",
@@ -277,7 +363,11 @@ __all__ = [
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
     "MSG_STATUS",
+    "MSG_HUB_STATUS",
     "MSG_SPEAKER",
+    "MSG_CONFIG_UPDATE",
+    "BACKGROUND_SERVER_MESSAGE_TYPES",
+    "is_background_server_frame",
     "SAY_STATUS_FIELD",
     "DEFAULT_STATUS_TTL_S",
     "MSG_ERROR",
@@ -296,3 +386,358 @@ __all__ = [
     "CLIENT_MESSAGE_TYPES",
     "SERVER_MESSAGE_TYPES",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Protocol v2 (ТЗ section 13)
+# ---------------------------------------------------------------------------
+# Every v2 text frame carries the same envelope: type, proto (=2), ts (ms),
+# home_id, client_id, seq, plus an optional utterance_id / event_id. The models
+# are strict (extra="forbid") and are collected into a discriminated union on
+# `type`, so an unknown frame is reported as a protocol error instead of being
+# guessed at. Binary frames keep the v1 rule: a binary payload always follows
+# the header that announced it, in the same session, with nothing in between.
+
+#: Current protocol version written into ``hello_ok``.
+PROTOCOL_VERSION = 2
+#: Frames without a ``proto`` field are v1 and stay accepted until phase 2 ends.
+LEGACY_PROTOCOL_VERSION = 1
+
+
+class ProtocolError(ValueError):
+    """A frame could not be parsed; the caller answers with an ``error`` frame."""
+
+
+class ClientKind(str, Enum):
+    ROOM_PC = "room_pc"
+    PHONE = "phone"
+    SENSOR_NODE = "sensor_node"
+
+
+class Role(str, Enum):
+    ADMIN = "admin"
+    TRUSTED = "trusted"
+    USER = "user"
+    GUEST = "guest"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class Envelope(BaseModel):
+    """Fields every v2 text frame carries (ТЗ section 13)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proto: Literal[2] = 2
+    ts: int = Field(default_factory=_now_ms, ge=0)
+    home_id: str = Field(default="", max_length=100)
+    client_id: str = Field(default="", max_length=100)
+    seq: int = Field(default=0, ge=0)
+    utterance_id: str | None = Field(default=None, max_length=100)
+    event_id: str | None = Field(default=None, max_length=100)
+
+
+class Track(BaseModel):
+    """One person track reported by a client (F-201)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    track_id: str = Field(min_length=1, max_length=100)
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    conf: float = Field(default=0.0, ge=0.0, le=1.0)
+    zone: str = Field(default="", max_length=100)
+    since: float = 0.0
+
+
+class ActionItem(BaseModel):
+    """One tool call the client must execute."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=100)
+    kind: str = Field(min_length=1, max_length=100)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+# --- client -> server -------------------------------------------------------
+
+
+class Hello(Envelope):
+    type: Literal["hello"] = "hello"
+    token: str = Field(default="", max_length=200)
+    kind: ClientKind = ClientKind.ROOM_PC
+    caps: list[str] = Field(default_factory=list)
+    version: str = Field(default="", max_length=50)
+    hw: str = Field(default="", max_length=200)
+    #: ТЗ F-303: privacy mode lives on the CLIENT, so a client that restarted
+    #: says what it really has and the hub believes it over its own memory.
+    privacy: bool = False
+
+
+class UtteranceStart(Envelope):
+    type: Literal["utterance_start"] = "utterance_start"
+    sample_rate: int = Field(default=MIC_SAMPLE_RATE, gt=0)
+    channels: int = Field(default=AUDIO_CHANNELS, gt=0)
+    pre_roll_ms: int = Field(default=0, ge=0)
+    #: F-103: ``True`` when this utterance arrived inside the client's own
+    #: follow-up window (no wake word was said), ``False`` when it did not,
+    #: ``None`` for a client that predates the window and must keep its old
+    #: behaviour. The hub asks D-02/D-11 about the turn either way.
+    followup: bool | None = None
+
+
+class UtteranceEnd(Envelope):
+    type: Literal["utterance_end"] = "utterance_end"
+
+
+class ActionResult(Envelope):
+    type: Literal["action_result"] = "action_result"
+    action_id: str = Field(min_length=1, max_length=100)
+    ok: bool
+    detail: str = Field(default="", max_length=2000)
+
+
+class Tracks(Envelope):
+    type: Literal["tracks"] = "tracks"
+    tracks: list[Track] = Field(default_factory=list)
+
+
+class BodyCropHeader(Envelope):
+    type: Literal["body_crop"] = "body_crop"
+    track_id: str = Field(min_length=1, max_length=100)
+    kind: Literal["body", "face"] = "body"
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class FaceBurstHeader(Envelope):
+    type: Literal["face_burst"] = "face_burst"
+    track_id: str = Field(default="", max_length=100)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class ScreenshotHeader(Envelope):
+    type: Literal["screenshot"] = "screenshot"
+    format: Literal["jpeg"] = "jpeg"
+
+
+class CameraFrameHeader(Envelope):
+    type: Literal["camera_frame"] = "camera_frame"
+    reason: Literal["presence", "request"] = "request"
+    index: int = Field(default=1, ge=1)
+    of: int = Field(default=1, ge=1)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class CameraClipHeader(Envelope):
+    type: Literal["camera_clip"] = "camera_clip"
+    format: Literal["mp4"] = "mp4"
+    bytes: int = Field(default=0, ge=0)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0.0, ge=0.0)
+    fps: int = Field(default=0, ge=0)
+
+
+class SoundEvent(Envelope):
+    type: Literal["sound_event"] = "sound_event"
+    label: str = Field(min_length=1, max_length=100)
+    conf: float = Field(default=0.0, ge=0.0, le=1.0)
+    at_ms: int = Field(default=0, ge=0)
+
+
+class DeviceState(Envelope):
+    type: Literal["device_state"] = "device_state"
+    device_id: str = Field(min_length=1, max_length=100)
+    capability: str = Field(min_length=1, max_length=100)
+    value: Any = None
+
+
+class BargeIn(Envelope):
+    type: Literal["barge_in"] = "barge_in"
+    say_id: str = Field(default="", max_length=100)
+    at_ms: int = Field(default=0, ge=0)
+
+
+class Ping(Envelope):
+    type: Literal["ping"] = "ping"
+
+
+class Pong(Envelope):
+    type: Literal["pong"] = "pong"
+
+
+# --- server -> client -------------------------------------------------------
+
+
+class HelloOk(Envelope):
+    type: Literal["hello_ok"] = "hello_ok"
+    session_id: str = Field(min_length=1, max_length=100)
+    server_version: str = Field(default="", max_length=50)
+    config_rev: int = Field(default=1, ge=0)
+
+
+class HelloErr(Envelope):
+    type: Literal["hello_err"] = "hello_err"
+    code: int = 4401
+    message: str = Field(default="", max_length=500)
+
+
+class Transcript(Envelope):
+    type: Literal["transcript"] = "transcript"
+    text: str = ""
+    partial: bool = False
+    language: str = Field(default="", max_length=20)
+    speaker: str = Field(default="", max_length=100)
+
+
+class Actions(Envelope):
+    type: Literal["actions"] = "actions"
+    actions: list[ActionItem] = Field(default_factory=list)
+
+
+class Say(Envelope):
+    type: Literal["say"] = "say"
+    say_id: str = Field(default="", max_length=100)
+    text: str = ""
+    voice: str = Field(default="", max_length=100)
+    volume: float | None = Field(default=None, ge=0.0, le=1.0)
+    interruptible: bool = True
+
+
+class TtsStart(Envelope):
+    type: Literal["tts_start"] = "tts_start"
+    say_id: str = Field(default="", max_length=100)
+    sample_rate: int = Field(default=48000, gt=0)
+    format: Literal["pcm_s16le"] = "pcm_s16le"
+    channels: int = Field(default=1, gt=0)
+
+
+class TtsEnd(Envelope):
+    type: Literal["tts_end"] = "tts_end"
+    say_id: str = Field(default="", max_length=100)
+
+
+class ListenFollowup(Envelope):
+    type: Literal["listen_followup"] = "listen_followup"
+    window_ms: int = Field(default=0, ge=0)
+
+
+class Identity(Envelope):
+    type: Literal["identity"] = "identity"
+    track_id: str = Field(min_length=1, max_length=100)
+    person_id: str | None = Field(default=None, max_length=100)
+    name: str | None = Field(default=None, max_length=120)
+    p: float = Field(default=0.0, ge=0.0, le=1.0)
+    role: Role = Role.USER
+
+
+class CameraRequest(Envelope):
+    type: Literal["camera_request"] = "camera_request"
+    kind: Literal["frame", "clip"] = "frame"
+    zone: str = Field(default="", max_length=100)
+    burst: int = Field(default=CAMERA_BURST_DEFAULT, ge=1, le=CAMERA_BURST_MAX)
+    full: bool = False
+    clip_seconds: int = Field(default=0, ge=0, le=10)
+
+
+class ScreenshotRequest(Envelope):
+    type: Literal["screenshot_request"] = "screenshot_request"
+
+
+class CameraClipRequest(Envelope):
+    type: Literal["camera_clip_request"] = "camera_clip_request"
+    seconds: int = Field(default=5, ge=3, le=10)
+    fps: int = Field(default=8, ge=5, le=10)
+
+
+class Privacy(Envelope):
+    """Server → client: the camera of this room goes off, or comes back (F-303)."""
+
+    type: Literal["privacy"] = "privacy"
+    on: bool = True
+    reason: str = Field(default="", max_length=100)
+
+
+class DeviceSet(Envelope):
+    type: Literal["device_set"] = "device_set"
+    device_id: str = Field(min_length=1, max_length=100)
+    capability: str = Field(min_length=1, max_length=100)
+    value: Any = None
+    action_id: str = Field(default="", max_length=100)
+
+
+class Hud(Envelope):
+    type: Literal["hud"] = "hud"
+    kind: Literal["state", "card", "overlay"] = "state"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfigUpdate(Envelope):
+    type: Literal["config_update"] = "config_update"
+    config_rev: int = Field(default=1, ge=0)
+    patch: dict[str, Any] = Field(default_factory=dict)
+
+
+class OfflineHint(Envelope):
+    type: Literal["offline_hint"] = "offline_hint"
+    reason: str = Field(default="", max_length=200)
+    eta_s: float = Field(default=0.0, ge=0.0)
+
+
+class Intercom(Envelope):
+    type: Literal["intercom"] = "intercom"
+    from_person: str = Field(default="", max_length=120)
+    text: str = ""
+    audio: str | None = Field(default=None, max_length=500)
+
+
+class ErrorMessage(Envelope):
+    type: Literal["error"] = "error"
+    code: int = 0
+    message: str = Field(default="", max_length=500)
+    ref_seq: int | None = Field(default=None, ge=0)
+
+
+ClientMessage = Annotated[
+    Hello | UtteranceStart | UtteranceEnd | ActionResult | Tracks | BodyCropHeader | FaceBurstHeader | ScreenshotHeader | CameraFrameHeader | CameraClipHeader | SoundEvent | DeviceState | BargeIn | Ping | Pong,
+    Field(discriminator="type"),
+]
+ServerMessage = Annotated[
+    HelloOk | HelloErr | Transcript | Actions | Say | TtsStart | TtsEnd | ListenFollowup | Identity | CameraRequest | ScreenshotRequest | CameraClipRequest | DeviceSet | Hud | ConfigUpdate | OfflineHint | Intercom | ErrorMessage,
+    Field(discriminator="type"),
+]
+
+_CLIENT_ADAPTER: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
+_SERVER_ADAPTER: TypeAdapter[ServerMessage] = TypeAdapter(ServerMessage)
+
+
+def protocol_version(raw: Mapping[str, Any]) -> int:
+    """The frame's protocol version; frames without ``proto`` are v1."""
+    value = raw.get("proto", LEGACY_PROTOCOL_VERSION)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return LEGACY_PROTOCOL_VERSION
+    return value
+
+
+def parse_message(raw: Mapping[str, Any], *, direction: str = "client") -> BaseModel | None:
+    """Parse a v2 frame; return ``None`` for a v1 frame (caller keeps v1 path).
+
+    Raises :class:`ProtocolError` for an unknown or malformed v2 frame. The
+    caller reports it as an ``error`` frame and keeps the connection open.
+    """
+    if not isinstance(raw, Mapping):
+        raise ProtocolError("A control frame must be a JSON object.")
+    if protocol_version(raw) < PROTOCOL_VERSION:
+        return None
+    if direction not in {"client", "server"}:
+        raise ProtocolError(f"Unknown direction {direction!r}.")
+    adapter = _CLIENT_ADAPTER if direction == "client" else _SERVER_ADAPTER
+    try:
+        return adapter.validate_python(dict(raw))
+    except ValidationError as exc:
+        raise ProtocolError(str(exc)) from None

@@ -1,9 +1,16 @@
 """WebSocket transport for the room client (SPEC §4, §7).
 
 Thin wrapper around the ``websockets`` library: connect with auto-reconnect
-(3 s backoff, ``hello`` re-sent on every (re)connect), send JSON control
-frames and binary payloads (microphone PCM, screenshot JPEG), receive
-messages. Text frames come back as parsed ``dict``, binary frames as ``bytes``.
+(``hello`` re-sent on every (re)connect), send JSON control frames and binary
+payloads (microphone PCM, screenshot JPEG), receive messages. Text frames come
+back as parsed ``dict``, binary frames as ``bytes``.
+
+Since ТЗ 4.8 the wait between attempts is a policy of the caller
+(``backoff(attempt)``): the room client passes the exponential delay of
+``client/offline.py`` and a ``before_retry`` hook, which is how the HUD learns
+about a long outage and the room hears «Хаб недоступен, работаю локально».
+Without those arguments the old fixed ``reconnect_delay`` is used, so nothing
+that predates the offline mode changes behaviour.
 
 Since v1.4 exactly one task — the reader in :mod:`client.main` — calls
 :meth:`WSClient.recv` for the lifetime of a connection (the server may talk
@@ -14,9 +21,11 @@ between utterances: proactive greetings, ``camera_request``), so it reads with
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, Optional, Union
+from collections.abc import Callable
+from typing import Any, Union
 
 try:  # websockets >= 13 (new asyncio implementation)
     from websockets.asyncio.client import connect as ws_connect
@@ -46,7 +55,7 @@ RECV_TIMEOUT_S = 420.0
 #: connection, which makes the pending ``recv`` raise.
 WAIT_FOREVER = 0.0
 
-Message = Union[Dict[str, Any], bytes]
+Message = Union[dict[str, Any], bytes]
 
 
 class WSDisconnected(Exception):
@@ -59,11 +68,13 @@ class WSClient:
     def __init__(
         self,
         url: str,
-        hello: Dict[str, Any],
+        hello: dict[str, Any],
         reconnect_delay: float = RECONNECT_DELAY_S,
         ready_timeout: float = READY_TIMEOUT_S,
         recv_timeout: float = RECV_TIMEOUT_S,
-        should_stop: Optional[Callable[[], bool]] = None,
+        should_stop: Callable[[], bool] | None = None,
+        backoff: Callable[[int], float] | None = None,
+        before_retry: Callable[[float, int], Any] | None = None,
     ) -> None:
         self.url = str(url)
         self.hello = dict(hello)
@@ -71,6 +82,14 @@ class WSClient:
         self.ready_timeout = float(ready_timeout)
         self.recv_timeout = float(recv_timeout)
         self._should_stop = should_stop or (lambda: False)
+        #: ТЗ 4.8: exponential delay for attempt ``n`` (1-based); ``None`` keeps
+        #: the historical fixed ``reconnect_delay``.
+        self._backoff = backoff
+        #: ТЗ 4.8: called with ``(delay, attempt)`` before every wait. The room
+        #: client uses it to put «мозг оффлайн» on the HUD and to say once that
+        #: it is working locally. An awaitable result is awaited.
+        self._before_retry = before_retry
+        self.attempts = 0
         self._conn: Any = None
         self._send_lock = asyncio.Lock()
         self._announced_failure = False
@@ -124,7 +143,7 @@ class WSClient:
                     close_timeout=3,
                     max_size=None,
                 )
-            except (OSError, WebSocketException, asyncio.TimeoutError, TimeoutError) as exc:
+            except (OSError, WebSocketException, TimeoutError) as exc:
                 if not self._announced_failure:
                     log.warning(
                         "No connection to the server %s (%s). Retrying every %.0f s...",
@@ -133,23 +152,46 @@ class WSClient:
                     self._announced_failure = True
                 else:
                     log.debug("Reconnect attempt failed: %s", exc)
-                await self._sleep(self.reconnect_delay)
+                await self._wait_before_retry()
                 continue
 
             self._conn = conn
             try:
                 await self.send_json(self.hello)
                 await self._await_ready()
-            except (WSDisconnected, asyncio.TimeoutError, TimeoutError) as exc:
+            except (WSDisconnected, TimeoutError) as exc:
                 log.warning("Handshake with the server failed: %s", exc)
                 self._drop()
-                await self._sleep(self.reconnect_delay)
+                await self._wait_before_retry()
                 continue
 
             self._announced_failure = False
+            self.attempts = 0
             log.info("Connected to the server %s", self.url)
             return
         raise WSDisconnected("the client is shutting down")
+
+    async def _wait_before_retry(self) -> None:
+        """One wait between two attempts, with its own delay policy (ТЗ 4.8)."""
+        self.attempts += 1
+        delay = self.reconnect_delay
+        if self._backoff is not None:
+            try:
+                delay = float(self._backoff(self.attempts))
+            except Exception as exc:  # noqa: BLE001 - a bad policy cannot stop the room
+                log.warning("The reconnect backoff failed (%s); waiting %.0f s",
+                            exc, self.reconnect_delay)
+                delay = self.reconnect_delay
+        if self._before_retry is not None:
+            try:
+                result = self._before_retry(delay, self.attempts)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the retry itself is what matters
+                log.debug("The retry hook failed (%s)", exc)
+        await self._sleep(delay)
 
     async def _await_ready(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.ready_timeout
@@ -176,7 +218,7 @@ class WSClient:
             waited += step
 
     # -- I/O -------------------------------------------------------------
-    async def send_json(self, payload: Dict[str, Any]) -> None:
+    async def send_json(self, payload: dict[str, Any]) -> None:
         conn = self._conn
         if conn is None:
             raise WSDisconnected("no connection")
@@ -199,7 +241,7 @@ class WSClient:
             self._drop()
             raise WSDisconnected(f"send failed: {exc}") from exc
 
-    async def recv(self, timeout: Optional[float] = None) -> Message:
+    async def recv(self, timeout: float | None = None) -> Message:
         """Next server message: parsed dict for text frames, bytes for binary.
 
         ``timeout`` is seconds, ``None`` means :data:`RECV_TIMEOUT_S` and
@@ -215,7 +257,7 @@ class WSClient:
                     raw = await conn.recv()
                 else:
                     raw = await asyncio.wait_for(conn.recv(), timeout=wait)
-            except (asyncio.TimeoutError, TimeoutError) as exc:
+            except TimeoutError as exc:
                 self._drop()
                 raise WSDisconnected("the server is not responding") from exc
             except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as exc:

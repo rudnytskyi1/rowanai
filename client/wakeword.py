@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class WakeWordDetector:
         if not cleaned:
             raise ValueError("The wake-word phrase list is empty (client.wakeword.phrases/word)")
         # Keep the order, drop duplicates.
-        self.phrases: List[str] = list(dict.fromkeys(cleaned))
+        self.phrases: list[str] = list(dict.fromkeys(cleaned))
         self._needles = [_normalize(p) for p in self.phrases]
         self.sample_rate = int(sample_rate)
         self.model_path = path
@@ -86,7 +86,7 @@ class WakeWordDetector:
             log.debug("KaldiRecognizer.SetWords is unavailable: %s", exc)
         return rec
 
-    def _match(self, text: str) -> Optional[str]:
+    def _match(self, text: str) -> str | None:
         if not text:
             return None
         haystack = _normalize(text)

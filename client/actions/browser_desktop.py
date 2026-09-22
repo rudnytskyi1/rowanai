@@ -6,14 +6,14 @@ by this controller. COM objects stay on one worker thread for their whole life.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import ctypes
-from ctypes import wintypes
-from dataclasses import dataclass
 import json
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from ctypes import wintypes
+from dataclasses import dataclass
 
 from . import pc
 from .app_control import BROWSERS, matches, visible_apps

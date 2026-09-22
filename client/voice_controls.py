@@ -131,13 +131,19 @@ class SilenceDetector:
         for rec in self._recognizers:
             rec.Reset()
 
-    def accept_frame(self, frame):
+    def accept_phrase(self, frame):
+        """The finalized local phrase, or ``None`` (F-117 uses the words too)."""
         for rec in self._recognizers:
             if rec.AcceptWaveform(frame):
                 text = json.loads(rec.Result()).get('text', '')
                 # Only finalized, complete utterances. A partial "shut up"
                 # might continue as "is a rude thing to say".
-                if is_silence_command(text):
+                if text:
                     self.reset()
-                    return True
-        return False
+                    return str(text)
+        return None
+
+    def accept_frame(self, frame):
+        """True when the room said a stop command (the pre-F-117 contract)."""
+        text = self.accept_phrase(frame)
+        return bool(text) and is_silence_command(text)
