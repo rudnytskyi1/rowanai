@@ -116,6 +116,16 @@ SHOT_DURATION_S = 0.7
 #: nothing is active any more, so the CSS fade-out (~300-480ms) gets to
 #: play out instead of being cut off by the window disappearing.
 HIDE_DELAY_S = 0.55
+#: How long a persistent badge (the missing echo canceller of ТЗ F-102, the
+#: camera-off notice of ТЗ F-303) may hold the window open on its own.
+#:
+#: The badge itself never goes away - it rides in every state snapshot the page
+#: receives, exactly as Ф-102/Ф-303 ask. What it may NOT do is keep a
+#: transparent overlay on screen forever: the room's owner saw the window sit
+#: over their desktop after every call, because "barge-in is off" counted as
+#: activity for as long as the client ran. A badge now announces itself for
+#: this long and then hands the screen back.
+BADGE_HOLD_S = 6.0
 
 #: The actual page shown in the WebView (client/overlay_web/hud.html).
 HUD_HTML_PATH = Path(__file__).resolve().parent / "overlay_web" / "chat.html"
@@ -244,6 +254,7 @@ def _is_active(
     typing_on: bool,
     flash_active: bool,
     click_active: bool,
+    badge_active: bool = False,
 ) -> bool:
     """Hidden-at-idle decision: is there anything worth showing right now?
 
@@ -252,10 +263,44 @@ def _is_active(
     a click ping, or a status caption. ``False`` only when all of those are
     quiet, which is when the native window is hidden. Pure and Qt-free so it
     can be unit-tested without ever creating a QApplication.
+
+    ``badge_active`` is the time-boxed half of ``status``: the persistent
+    badges (F-102's missing echo canceller, F-303's camera-off notice) are
+    drawn while the window is up, and they may hold it up for
+    :data:`BADGE_HOLD_S` - not for the whole life of the client.
     """
     if state != STATE_IDLE:
         return True
-    return bool(scanning or typing_on or flash_active or click_active or status)
+    return bool(scanning or typing_on or flash_active or click_active or status or badge_active)
+
+
+def _badge_deadline(now: float, text: Any) -> float:
+    """Until when a persistent badge keeps the HUD on screen on its own.
+
+    ``0.0`` means "not at all": either there is no badge, or it was cleared.
+    A badge that is already up is not extended by a redraw of the same text -
+    the caller stores the deadline and only a *new* badge restarts the clock.
+    """
+    return float(now) + BADGE_HOLD_S if str(text or "").strip() else 0.0
+
+
+def _visibility_now(owner: Any, now: float) -> bool:
+    """The hidden-at-idle decision for one live HUD, at one instant.
+
+    Split out of the Qt bridge so the rule is testable without a QApplication,
+    and so the persistent badges cannot sneak back in as a permanent reason to
+    stay on screen: what they contribute is ``_badge_until``, a deadline - not
+    their text.
+    """
+    return _is_active(
+        owner._state,
+        owner._status or owner._speaker_name,
+        owner._scanning,
+        owner._typing_on,
+        now < owner._flash_until,
+        now < owner._click_until,
+        now < getattr(owner, "_badge_until", 0.0),
+    )
 
 
 class OverlayHUD:
@@ -306,6 +351,10 @@ class OverlayHUD:
         #: ТЗ F-303: the camera is off (privacy mode) — a permanent badge, not
         #: a passing status: the room must be able to see it at a glance.
         self._camera_off = ""
+        #: Until when those badges may hold the window up on their own. They
+        #: stay in the page's snapshot, but only this long as a reason to keep
+        #: a transparent overlay over the owner's desktop (BADGE_HOLD_S).
+        self._badge_until = 0.0
         #: When the follow-up window stops listening (ТЗ F-103), 0 when closed.
         self._followup_until = 0.0
         #: Name currently shown centred on screen (v1.7), "" when none.
@@ -753,15 +802,7 @@ class OverlayHUD:
                 self._run_js(f"window.hudState && window.hudState({payload});")
 
             def _active_now(self) -> bool:
-                now = time.monotonic()
-                return _is_active(
-                    owner._state,
-                    owner._status or owner._speaker_name or owner._warning or owner._camera_off,
-                    owner._scanning,
-                    owner._typing_on,
-                    now < owner._flash_until,
-                    now < owner._click_until,
-                )
+                return _visibility_now(owner, time.monotonic())
 
             def _reconsider_visibility(self) -> None:
                 if self._active_now():
@@ -834,15 +875,22 @@ class OverlayHUD:
                 self._reconsider_visibility()
 
             def _on_warning(self, text: str) -> None:
+                """ТЗ F-102: the badge rides along and announces itself once."""
                 owner._warning = text
+                owner._badge_until = _badge_deadline(time.monotonic(), text)
                 self._sync_state()
                 self._reconsider_visibility()
+                if owner._badge_until:
+                    QTimer.singleShot(int(BADGE_HOLD_S * 1000) + 50, self._maybe_hide)
 
             def _on_camera(self, text: str) -> None:
-                """ТЗ F-303: the camera-off badge, shown until it is cleared."""
+                """ТЗ F-303: the camera-off badge; the window is not held forever."""
                 owner._camera_off = text
+                owner._badge_until = _badge_deadline(time.monotonic(), text)
                 self._sync_state()
                 self._reconsider_visibility()
+                if owner._badge_until:
+                    QTimer.singleShot(int(BADGE_HOLD_S * 1000) + 50, self._maybe_hide)
 
             def _on_followup(self, seconds: float) -> None:
                 """Draw the window draining, one tick per quarter second."""
@@ -914,6 +962,7 @@ class OverlayHUD:
                 # or not the HUD considers itself "active".
                 owner._flash_until = 0.0
                 owner._click_until = 0.0
+                owner._badge_until = 0.0
                 self._hide()
 
             def _on_stop(self) -> None:
