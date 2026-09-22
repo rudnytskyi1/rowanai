@@ -8,6 +8,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from common.frame_zones import FrameZone
+
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -129,6 +131,17 @@ class CameraConfig(_Strict):
     frame_recording: RecordingConfig = Field(default_factory=RecordingConfig)
     #: Ultralytics model file (downloaded automatically on first run).
     model: str = "yolo11n.pt"
+    #: ТЗ F-201: a light guard that watches for the FIRST sign of a person
+    #: between the heavy detector's frames. ``yolo11x`` needs ~300 ms per frame,
+    #: so on its own it samples the room about three times a second - and a
+    #: person who crosses it in half a second can be gone before the next
+    #: sample. The light model turns that first sighting into the presence burst
+    #: that carries the person's faces to the hub; the heavy model still owns
+    #: the tracks, the objects and the identity. ``""`` turns the guard off.
+    quick_model: str = Field(default="yolo11n.pt", max_length=120)
+    #: How often the guard may look. It runs on the frames the capture thread
+    #: already has, so this is an upper bound, not an extra camera read.
+    quick_fps: float = Field(default=8.0, ge=0.5, le=240.0)
     #: ТЗ F-312: pick the detection profile by MEASURED latency at startup.
     #: Off by default: a shipped client keeps exactly the profile its config
     #: names, and a machine that wants the automatic choice turns it on.
@@ -145,6 +158,42 @@ class CameraConfig(_Strict):
     #: On by default; a hub that predates the message ignores it and the
     #: ``camera_state`` frame still carries the same tracks.
     tracks_message: bool = True
+    #: ТЗ F-309: зоны кадра — «дверь», «стол», «кровать», «маска (не
+    #: анализировать)». Владелец рисует их в конфиге дома, и хаб присылает их
+    #: комнате сообщением ``config_update``; поле здесь нужно затем, чтобы
+    #: комната без хаба (или до первого патча) уже знала свои маски. Маска
+    #: закрашивается ДО JPEG, поэтому кадр уходит уже без неё.
+    zones: list[FrameZone] = Field(default_factory=list)
+
+
+class GesturesConfig(_Strict):
+    """Жесты руки на клиенте (``client.gestures``, ТЗ F-306).
+
+    MediaPipe Hands работает на CPU комнаты, кадры никуда не уходят. Жесты
+    включаются НА ДОМ отдельно: флаг ``homes[].settings.gestures`` приходит
+    комнате патчем, а поле здесь нужно комнате без хаба (или до патча).
+    """
+
+    enabled: bool = False
+    #: Сколько жест держится, прежде чем он сработает («ладонь дольше 1 с»).
+    hold_s: float = Field(default=1.0, gt=0.0, le=10.0)
+    #: Не чаще одного распознавания за это время (CPU делится с YOLO).
+    interval_s: float = Field(default=0.2, ge=0.0, le=5.0)
+
+
+class PostureConfig(_Strict):
+    """Поза и сон на клиенте (``client.posture``, ТЗ F-307).
+
+    YOLO11-pose работает на CPU комнаты с низкой частотой; кадры никуда не
+    уходят, наружу идут только события «уснул» и «встал». Включается НА ДОМ
+    (``homes[].settings.posture``), поле здесь — для комнаты без хаба.
+    """
+
+    enabled: bool = False
+    #: ТЗ F-307: один кадр в 5 секунд.
+    interval_s: float = Field(default=5.0, ge=0.5, le=120.0)
+    #: ТЗ F-307: «лежит неподвижно дольше 10 мин».
+    still_s: float = Field(default=600.0, ge=60.0, le=7200.0)
 
 
 class OverlayConfig(_Strict):
@@ -177,6 +226,10 @@ class DeviceConfig(BaseModel):
     type: str
     area: str | None = None
     description: str | None = None
+    #: ТЗ F-606: a device a GUEST may not touch (the owner's own kit). The
+    #: client reports it in its ``hello`` device list, and the hub refuses a
+    #: guest with a sentence about the owner instead of "device not found".
+    restricted: bool = False
     #: Type-specific fields taken from the same YAML mapping.
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -185,7 +238,7 @@ class DeviceConfig(BaseModel):
     def _collect_params(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        first_class = {"name", "type", "area", "description", "params"}
+        first_class = {"name", "type", "area", "description", "restricted", "params"}
         explicit = data.get("params")
         params: dict[str, Any] = dict(explicit) if isinstance(explicit, dict) else {}
         for key, value in data.items():
@@ -265,6 +318,10 @@ class ClientConfig(_Strict):
     vad: VADConfig = Field(default_factory=VADConfig)
     #: Room camera: YOLO presence state + face frames for the server (v1.4).
     camera: CameraConfig = Field(default_factory=CameraConfig)
+    #: ТЗ F-306: жесты руки (MediaPipe Hands на CPU комнаты).
+    gestures: GesturesConfig = Field(default_factory=GesturesConfig)
+    #: ТЗ F-307: поза и сон (YOLO11-pose, 1 кадр в 5 с).
+    posture: PostureConfig = Field(default_factory=PostureConfig)
     #: Sci-fi HUD overlay on the TV.
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     #: Seconds to keep listening after a reply without the wake word (0 = off).

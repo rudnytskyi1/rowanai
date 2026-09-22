@@ -58,6 +58,10 @@ TOOL_BROWSER = "browser_control"
 TOOL_APP_ACTION = 'app_action'
 TOOL_SAVE_PHOTO = 'save_photo_file'
 TOOL_SET_WALLPAPER = 'set_wallpaper_file'
+#: ТЗ F-512: one step of a computer-use run. The executor (and the policy the
+#: hub sent with it) lives in the client's main loop, so the dispatcher asks it
+#: through the ``computer_use`` callback instead of owning one itself.
+TOOL_COMPUTER_USE = 'computer_use_step'
 TOOLS = frozenset(
     {
         TOOL_SET_LIGHT,
@@ -69,6 +73,7 @@ TOOLS = frozenset(
         TOOL_APP_ACTION,
         TOOL_SAVE_PHOTO,
         TOOL_SET_WALLPAPER,
+        TOOL_COMPUTER_USE,
     }
 )
 
@@ -94,12 +99,15 @@ def _error_text(exc: BaseException) -> str:
 class Dispatcher:
     """Routes protocol action items to devices (SPEC §8) and to the PC controller."""
 
-    def __init__(self, cfg_client: Any, registry: Any) -> None:
+    def __init__(self, cfg_client: Any, registry: Any,
+                 computer_use: Any = None) -> None:
         self.cfg = cfg_client
         self.registry = registry
         self.pc = PCController(self._apps_of(cfg_client))
         self.browser = DesktopBrowserController()
         self.applications = AppController(self.pc.apps)
+        #: ``async (args) -> dict`` из главного цикла клиента (ТЗ F-512).
+        self.computer_use = computer_use
 
     # -- construction helpers ----------------------------------------------
 
@@ -186,6 +194,19 @@ class Dispatcher:
                 from .wallpaper import set_wallpaper
                 result = await asyncio.wait_for(asyncio.to_thread(set_wallpaper, args), timeout=20)
                 output, detail = json.dumps(result), 'Desktop wallpaper applied and verified'
+            elif tool == TOOL_COMPUTER_USE:
+                import json
+
+                if self.computer_use is None:
+                    return False, 'computer use is not available on this client', None
+                report = await asyncio.wait_for(self.computer_use(args), timeout=PC_TIMEOUT_S)
+                output = json.dumps(report)
+                if report.get('ok'):
+                    detail = str(report.get('step') or 'computer-use step done')
+                else:
+                    # Отказ F-512 — это не сбой клиента, но и не успех: хаб
+                    # получает и ``ok=False``, и причину в ``output``.
+                    return False, str(report.get('reason') or 'computer-use step refused'), output
             elif tool == TOOL_RUN_COMMAND:
                 ok, error, output = await asyncio.wait_for(
                     self._run_command(args), timeout=RUN_COMMAND_TIMEOUT_S
@@ -287,7 +308,8 @@ class Dispatcher:
     async def _pc_control(self, args: dict[str, Any]) -> PCResult:
         command = args.get("command")
         value = args.get("value")
-        result = await self.pc.execute(command, value)
+        target = args.get("target")
+        result = await self.pc.execute(command, value, target)
         if not result.detail:
             return PCResult(f"pc_control: {command}", result.output)
         return result

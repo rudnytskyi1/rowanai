@@ -61,6 +61,16 @@ from typing import Any
 from client.body_crops import CropSchedule, encode_crop
 from client.privacy import PrivacyMode
 from client.tracking import TrackRegistry, write_tracker_config
+from common.attention_objects import attention_group
+from common.frame_zones import (
+    FrameZone,
+    mask_polygons,
+    masked_at,
+    masks_rev,
+    parse_zones,
+    zone_at,
+    zones_rev,
+)
 from common.ids import new_ulid
 from common.protocol import (
     CAMERA_BURST_MAX,
@@ -72,6 +82,7 @@ from common.protocol import (
     MSG_CAMERA_FRAME,
     MSG_CAMERA_REQUEST,
     MSG_CAMERA_STATE,
+    MSG_OBJECT_EVENT,
     MSG_TRACKS,
 )
 
@@ -100,6 +111,11 @@ MIN_FPS = 0.2
 MAX_FPS = 240.0
 #: A frame older than this is not worth sending to the server any more.
 STALE_FRAME_S = 10.0
+#: While somebody is in the room - and this long after the last sighting -
+#: the detector runs frame by frame instead of at the configured FPS cap. The
+#: cap is a budget for an empty room; a fast pass-by is exactly the moment the
+#: next frames decide whether the person is seen at all (ТЗ F-201).
+ACTIVE_DETECTION_HOLD_S = 3.0
 #: How many consecutive failed ``VideoCapture.read()`` calls mean the device is
 #: gone (a C920 briefly stumbles when another app grabs it).
 MAX_READ_FAILURES = 30
@@ -114,12 +130,31 @@ BURST_FRAME_INTERVAL_S = 0.25
 #: waits for a genuinely new capture-thread frame before giving up on one slot
 #: of a burst (a stalled camera must not hang the whole request).
 FRESH_FRAME_WAIT_S = 0.5
+#: ТЗ F-201: a quick pass-by is shorter than the heavy detector's own frame.
+#: YOLO11x needs ~300 ms per frame, so on the owner's PC the accurate detector
+#: samples the room about three times a second and a person crossing it in half
+#: a second can be gone before the next sample. The light guard runs between
+#: those frames and turns the first sighting into the presence burst.
+QUICK_PASS_MODEL = "yolo11n.pt"
+#: Default guard rate (``cfg.client.camera.quick_fps``).
+QUICK_PASS_FPS = 8.0
+#: Guard confidence. Lower than :data:`CONF_THRESHOLD` on purpose: the guard
+#: only has to notice that somebody is there, and a missed pass-by costs the
+#: room its notification. The heavy detector decides who it was.
+QUICK_PASS_CONF = 0.35
+#: The guard infers at the same size the heavy detector uses, so the two agree
+#: about what "a person" means at this camera's distance.
+QUICK_PASS_IMGSZ = 640
+#: Two guard-triggered bursts closer than this are the same person walking
+#: through, not two people: the hub needs a burst, not a stream of them.
+QUICK_PASS_COOLDOWN_S = 4.0
 
 SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 SendBytes = Callable[[bytes], Awaitable[None]]
 
 __all__ = [
     "MSG_CAMERA_STATE",
+    "MSG_OBJECT_EVENT",
     "MSG_TRACKS",
     "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
@@ -234,7 +269,18 @@ class CameraService:
         #: ТЗ F-303: пока privacy-режим включён, кадры не уходят вообще —
         #: проверяется в каждой точке, где клиент отдаёт картинку.
         self._privacy_mode = PrivacyMode(str(_attr(cfg_camera, 'language', 'en') or 'en'))
+        #: ТЗ F-309: зоны кадра дома. Маска закрашивается ЗДЕСЬ, до JPEG,
+        #: поэтому кадр уходит в хаб уже без неё; хаб сверяет отпечаток масок
+        #: (``zones_rev`` в заголовке) со своим конфигом.
+        self._zones: list[FrameZone] = parse_zones(_attr(cfg_camera, 'zones', None))
         self.model_name = str(_attr(cfg_camera, "model", "yolo11n.pt") or "yolo11n.pt")
+        #: ТЗ F-201: the light guard (``_quick_gate_loop``) that watches for the
+        #: first sign of a person between the heavy detector's frames. An empty
+        #: name, or the same weights as the heavy model, turns it off.
+        self.quick_model_name = str(_attr(cfg_camera, "quick_model", QUICK_PASS_MODEL) or "").strip()
+        self.quick_fps = max(
+            0.0, _as_float(_attr(cfg_camera, "quick_fps", QUICK_PASS_FPS), QUICK_PASS_FPS)
+        )
         self.face_check_interval_s = max(
             0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 0.5), 0.5)
         )
@@ -263,6 +309,7 @@ class CameraService:
         self._new_frame = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._infer_thread: threading.Thread | None = None
+        self._quick_thread: threading.Thread | None = None
 
         # --- latest frame ---
         self._frame_lock = threading.Lock()
@@ -279,12 +326,45 @@ class CameraService:
         self._detect_errors = 0
         self._send_errors = 0
         self._frame_seq = 0
+        #: ТЗ F-311: (группа, зона) объектов внимания, о которых комната уже
+        #: сказала хабу. Событие рождается на ПЕРЕХОДЕ, иначе «посылка у
+        #: двери» приходило бы каждые полсекунды, пока посылка стоит.
+        self._attention_seen: set[tuple[str, str]] = set()
+        #: Находки внимания последнего кадра (ТЗ F-311): их читает
+        #: ``_publish_attention`` сразу после ``_publish_state``.
+        self._attention_found: list[dict[str, Any]] = []
         self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
+        #: ТЗ F-201: поднят, когда трек только что появился — такой проход
+        #: нельзя ждать до следующего периодического кадра, он уходит сразу
+        #: и целиком бёрстом (см. ``_maybe_push_presence``).
+        self._burst_due = False
+        #: ТЗ F-201: боксы, которые сторож увидел последним. Они уезжают в тот
+        #: самый бёрст: без них человек спиной к камере не считается «в кадре»
+        #: ни для правил хаба, ни для привязки лица к треку.
+        self._quick_tracks: list[dict[str, Any]] = []
+        #: Когда сторож последний раз забирал бёрст (monotonic, см. кулдаун).
+        self._quick_burst_at = 0.0
+        self._quick_errors = 0
+        self._quick_count = 0
+        #: Когда человека видели в последний раз (monotonic): пока он в
+        #: комнате, детектор не ждёт лимит кадров (``_detection_budget``).
+        self._last_person_seen = 0.0
+        #: ТЗ F-306: необязательный слушатель кадров (жесты руки). Он получает
+        #: кадр ПОСЛЕ отправки и не может ни задержать, ни сломать камеру.
+        self._on_frame: Any = None
         #: ``event_id`` of the request being answered (ТЗ 4.5); empty for an
         #: unsolicited presence push, which mints its own id.
         self._request_event_id = ''
+
+    def set_frame_listener(self, listener: Any) -> None:
+        """Подписаться на каждый обработанный кадр (ТЗ F-306: жесты руки).
+
+        Вызывается из потока YOLO, поэтому обработчик обязан быть быстрым и
+        не бросать исключений: любая его ошибка глушится (см. `_infer_loop`).
+        """
+        self._on_frame = listener
 
     # ------------------------------------------------------------------
     # state
@@ -314,6 +394,39 @@ class CameraService:
     @privacy.setter
     def privacy(self, mode: PrivacyMode) -> None:
         self._privacy_mode = mode
+
+    # ------------------------------------------------------------------
+    # frame zones (ТЗ F-309)
+    # ------------------------------------------------------------------
+    @property
+    def zones(self) -> list[FrameZone]:
+        """Зоны кадра, которые комната сейчас применяет (ТЗ F-309)."""
+        return list(getattr(self, "_zones", ()))
+
+    @property
+    def masked_rev(self) -> str:
+        """Отпечаток масок этого клиента; ``""`` — масок нет.
+
+        Именно его хаб сверяет со своим конфигом: кадр считается
+        замаскированным, только если комната закрасила те же области.
+        """
+        return masks_rev(getattr(self, "_zones", ()))
+
+    def set_zones(self, raw: Any) -> bool:
+        """Зоны кадра от хаба (``config_update``, ТЗ F-309).
+
+        :returns: ``True``, если набор зон реально изменился (тогда следующий
+            кадр уже понесёт новый отпечаток масок и хаб не откажет).
+        """
+        fresh = parse_zones(raw)
+        current = list(getattr(self, "_zones", ()))
+        if zones_rev(fresh) == zones_rev(current):
+            return False
+        self._zones = fresh
+        masks = [zone for zone in fresh if zone.mask]
+        log.info("Camera frame zones updated: %d zone(s), %d mask(s), rev %s",
+                 len(fresh), len(masks), self.masked_rev or "-")
+        return True
 
     @property
     def running(self) -> bool:
@@ -415,13 +528,20 @@ class CameraService:
         )
         self._capture_thread.start()
         self._infer_thread.start()
+        if self._quick_model():
+            self._quick_thread = threading.Thread(
+                target=self._quick_gate_loop, name="jarvis-camera-quick", daemon=True
+            )
+            self._quick_thread.start()
         log.info(
             "Camera service starting: device index %d, %s at %.1f fps, "
-            "one presence frame every %.1f s",
+            "one presence frame every %.1f s%s",
             self.index,
             self.model_name,
             self.fps,
             self.face_check_interval_s,
+            (f", quick pass guard {self._quick_model()} at %.1f fps" % self.quick_fps)
+            if self._quick_model() else " (quick pass guard off)",
         )
         return True
 
@@ -430,16 +550,18 @@ class CameraService:
         self._stop_event.set()
         self._capture_ready.set()
         self._new_frame.set()
-        for thread in (self._infer_thread, self._capture_thread):
+        for thread in (self._quick_thread, self._infer_thread, self._capture_thread):
             if thread is None or not thread.is_alive():
                 continue
             thread.join(timeout=JOIN_TIMEOUT_S)
             if thread.is_alive():  # pragma: no cover - a stuck driver call
                 log.debug("Camera thread %s did not stop in time", thread.name)
-        if self._capture_thread is not None or self._infer_thread is not None:
+        if (self._capture_thread is not None or self._infer_thread is not None
+                or self._quick_thread is not None):
             log.info("Camera service stopped")
         self._capture_thread = None
         self._infer_thread = None
+        self._quick_thread = None
         if self._frame_recorder is not None:
             self._frame_recorder.close()
             self._frame_recorder = None
@@ -885,10 +1007,21 @@ class CameraService:
                 else:
                     self._detect_errors = 0
                     self._inferred_count += 1
+                    if persons >= 1:
+                        self._last_person_seen = time.monotonic()
                     self._cache_detection(frame, frame_ts)
                     self._publish_state(persons, objects)
+                    self._publish_attention(getattr(self, '_attention_found', []))
                     self._publish_tracks()
                     self._publish_body_crops(frame)
+                    listener = getattr(self, '_on_frame', None)
+                    if listener is not None:
+                        # ТЗ F-306: жесты руки считаются на этом же кадре, но их
+                        # ошибка не имеет права уронить камеру или ход.
+                        try:
+                            listener(frame)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("Frame listener failed (%s)", exc)
                     if persons >= 1:
                         if self._frame_recorder is not None:
                             self._frame_recorder.submit(frame, time.time() - (time.monotonic() - frame_ts),
@@ -897,12 +1030,182 @@ class CameraService:
                                  'model': self.model_name}, stop_event=self._stop_event)
                         self._maybe_push_presence(frame)
                     self._report_performance()
+            remaining = self._detection_budget(interval) - (time.monotonic() - started)
+            if remaining > 0:
+                self._stop_event.wait(remaining)
+
+    def _detection_budget(self, interval: float) -> float:
+        """Seconds to wait before the next detection: none while people are here.
+
+        ``interval`` comes from the configured/measured FPS. Spending it while a
+        person is visible drops the very frames that identify them, so the
+        detector runs flat out from a sighting until ``ACTIVE_DETECTION_HOLD_S``
+        after the last one.
+        """
+        active = (bool(getattr(self, '_tracks', None))
+                  or time.monotonic() - float(getattr(self, '_last_person_seen', 0.0))
+                  <= ACTIVE_DETECTION_HOLD_S)
+        return 0.0 if active else interval
+
+    # ------------------------------------------------------------------
+    # quick pass guard (ТЗ F-201)
+    # ------------------------------------------------------------------
+    def _quick_model(self) -> str:
+        """The light guard's weights, or ``""`` when the guard is off.
+
+        Off means: switched off in the config, no rate, or the room's own
+        detector is already that light model - then there is nothing to add.
+        """
+        name = str(getattr(self, 'quick_model_name', '') or '').strip()
+        if not name or not getattr(self, 'quick_fps', 0.0):
+            return ''
+        return '' if name == self.model_name else name
+
+    def _quick_gate_loop(self) -> None:
+        """Watch for the first sign of a person between the heavy frames (F-201).
+
+        ON THE OWNER'S PC (2026-09-22): ``yolo11x`` needs ~300 ms per frame, so
+        the accurate detector sees the room roughly three times a second - a
+        person who walks past in half a second may never appear in one of its
+        frames, and no later stage can report somebody nobody saw. This thread
+        runs the LIGHT model on the frames the capture thread already has and,
+        on the first sighting while no track exists, releases the very next
+        presence burst with those boxes: the hub gets the person's picture (and
+        their face) while they are still in the room.
+
+        The guard never decides who it was, never publishes state, and never
+        throws into the camera: if the light weights cannot be loaded or keep
+        failing, the room simply works the way it did before this thread.
+        """
+        self._capture_ready.wait()
+        if self._stop_event.is_set() or not self._enabled:
+            return
+        name = self._quick_model()
+        if not name:
+            return
+        try:
+            yolo_class = self._import_yolo()
+            model = yolo_class(name)
+        except Exception as exc:  # noqa: BLE001 - the guard is optional
+            log.warning("Quick pass guard is off: %s could not be loaded (%s)", name, exc)
+            return
+        log.info("Quick pass guard running: %s at up to %.1f fps between the %s frames",
+                 name, self.quick_fps, self.model_name)
+        interval = 1.0 / self.quick_fps if self.quick_fps else 0.0
+        last_frame_ts = 0.0
+        while not self._stop_event.is_set():
+            if self._quick_model() != name:
+                # Автовыбор профиля (ТЗ F-312) перевёл тяжёлый детектор на те
+                # же лёгкие веса — второй раз смотреть ими незачем.
+                log.info("Quick pass guard stops: the detector now runs %s itself", name)
+                return
+            started = time.monotonic()
+            frame, frame_ts = self._latest_frame_ts()
+            if frame is None or frame_ts <= last_frame_ts:
+                self._stop_event.wait(0.02)
+                continue
+            last_frame_ts = frame_ts
+            if self.privacy.allows_frames and started - frame_ts <= STALE_FRAME_S:
+                try:
+                    boxes = self._quick_person_boxes(model, frame, frame_ts)
+                except Exception as exc:  # noqa: BLE001 - a broken guard is not a broken camera
+                    self._quick_errors += 1
+                    if self._quick_errors == 1:
+                        log.warning("The quick pass guard failed (%s)", exc)
+                    else:
+                        log.debug("The quick pass guard failed (%d): %s", self._quick_errors, exc)
+                    if self._quick_errors >= 10:
+                        log.warning("Quick pass guard stopped after %d failures", self._quick_errors)
+                        return
+                    self._stop_event.wait(0.5)
+                    continue
+                self._quick_errors = 0
+                self._quick_count += 1
+                if boxes:
+                    self._note_quick_persons(frame, boxes)
             remaining = interval - (time.monotonic() - started)
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int]]:
-        """Count people and objects in one frame by YOLO class name."""
+    def _quick_person_boxes(self, model: Any, frame: Any, frame_ts: float) -> list[dict[str, Any]]:
+        """Person boxes the light model sees in one frame, as wire tracks."""
+        results = model.predict(
+            source=frame, conf=QUICK_PASS_CONF, imgsz=QUICK_PASS_IMGSZ,
+            device=self.device, half=self.half, verbose=False,
+        )
+        return self._person_boxes(results, prefix=f'quick:{int(frame_ts * 1000)}')
+
+    @staticmethod
+    def _person_boxes(results: Any, *, prefix: str = 'quick') -> list[dict[str, Any]]:
+        """Read ``person`` boxes out of a plain ``predict`` result (never raises).
+
+        The hub reads either wire shape of a track, so the guard's boxes go out
+        as the v1.4 ``{"id", "box"}`` rows a ``camera_state`` already carries.
+        """
+        found: list[dict[str, Any]] = []
+        for result in results or []:
+            names = getattr(result, "names", None) or {}
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            classes = getattr(boxes, "cls", None)
+            confidences = getattr(boxes, "conf", None)
+            positions = getattr(boxes, "xyxyn", None)
+            if classes is None or confidences is None or positions is None:
+                continue
+            class_list = classes.tolist() if hasattr(classes, "tolist") else list(classes)
+            conf_list = confidences.tolist() if hasattr(confidences, "tolist") else list(confidences)
+            position_list = positions.tolist() if hasattr(positions, "tolist") else list(positions)
+            for index, (class_id, confidence) in enumerate(zip(class_list, conf_list)):
+                if float(confidence) < QUICK_PASS_CONF or index >= len(position_list):
+                    continue
+                class_index = int(class_id)
+                label = str(names.get(class_index, class_index) if isinstance(names, dict) else class_index)
+                if label != 'person':
+                    continue
+                x1, y1, x2, y2 = (max(0.0, min(1.0, float(value)))
+                                  for value in position_list[index][:4])
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                found.append({"id": f"{prefix}:{len(found)}", "box": [x1, y1, x2, y2]})
+        return found
+
+    def _quick_burst_due(self, now: float) -> bool:
+        """Should the guard take the next presence burst? (no track, not just now)."""
+        if getattr(self, '_tracks', None):
+            # The heavy detector already owns these frames (ТЗ F-201).
+            return False
+        if self._presence_pending.is_set():
+            return False
+        cooldown = float(getattr(self, '_quick_burst_at', 0.0)) + QUICK_PASS_COOLDOWN_S
+        return now >= cooldown
+
+    def _note_quick_persons(self, frame: Any, boxes: list[dict[str, Any]]) -> None:
+        """The guard saw somebody: hand the next presence burst to them (F-201)."""
+        now = time.monotonic()
+        self._last_person_seen = now
+        if not self._quick_burst_due(now):
+            return
+        self._quick_burst_at = now
+        self._burst_due = True
+        self._quick_tracks = list(boxes)
+        log.info('Quick pass guard saw %d person(s) - taking the presence burst now',
+                 len(boxes))
+        try:
+            self._maybe_push_presence(frame, frame_prefix='q')
+        except Exception as exc:  # noqa: BLE001 - the guard never breaks the camera
+            log.debug('Could not push the guard burst (%s)', exc)
+
+    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
+        """Count people and objects in one frame by YOLO class name.
+
+        Возвращает ещё и объекты внимания (ТЗ F-311) с зоной кадра: ``label``
+        — каноническая группа (кошка/собака/посылка), ``zone`` — имя зоны
+        дома, в которую попал центр находки. Объект, попавший в область «не
+        анализировать» (F-309), сюда не попадает: маску закрашивают, чтобы её
+        не смотрели, и сообщать о находке внутри неё было бы тем же
+        смотрением, только словами.
+        """
         tracker = getattr(self, 'tracker_path', None) or str(
             Path(__file__).with_name('room-tracker.yaml'))
         results = model.track(
@@ -917,6 +1220,7 @@ class CameraService:
         )
         counts: dict[str, int] = {}
         detections = []
+        attention: list[dict[str, Any]] = []
         for result in results or []:
             names = getattr(result, "names", None) or {}
             boxes = getattr(result, "boxes", None)
@@ -944,6 +1248,17 @@ class CameraService:
                         'bbox': [max(0., min(1., float(v))) for v in positions[box_index]],
                         'conf': float(confidence),
                     })
+                    continue
+                group = attention_group(label)
+                if not group or box_index >= len(positions):
+                    continue
+                x1, y1, x2, y2 = (max(0., min(1., float(v))) for v in positions[box_index][:4])
+                centre = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                zones = getattr(self, '_zones', ())
+                if masked_at(zones, *centre):
+                    continue
+                attention.append({'label': group, 'zone': zone_at(zones, *centre),
+                                  'conf': float(confidence)})
         # ТЗ F-201: the registry keeps the id of a person who stepped out of
         # the frame for thirty seconds, so coming back is a re-association.
         self._track_reports = self.tracks.observe(detections, now=time.monotonic())
@@ -951,6 +1266,10 @@ class CameraService:
                          'box': [float(value) for value in report.bbox]}
                         for report in self._track_reports]
         persons = counts.pop("person", 0)
+        # ТЗ F-311: находки внимания читает `_publish_attention`; отдельным
+        # полем, а не третьим значением, чтобы `_detect` остался тем же
+        # вызовом, что и раньше (клиенты и тесты зовут его как пару).
+        self._attention_found = attention
         return int(persons), counts
 
     def _report_performance(self):
@@ -969,6 +1288,10 @@ class CameraService:
                  'capture_fps': round((self._captured_count - self._metrics_captured) / elapsed, 2),
                  'yolo_fps': round((self._inferred_count - self._metrics_inferred) / elapsed, 2),
                  'captured_frames': self._captured_count, 'processed_frames': self._inferred_count,
+                 # ТЗ F-201: how the light guard is doing - the number that says
+                 # whether a quick pass-by had anything to be caught by at all.
+                 'quick_guard': self._quick_model() or None,
+                 'quick_frames': self._quick_count,
                  'recording': self._frame_recorder.stats() if self._frame_recorder else None,
                  'archive_error': self._archive_error}
         self._metrics_at, self._metrics_captured, self._metrics_inferred = now, self._captured_count, self._inferred_count
@@ -1059,6 +1382,51 @@ class CameraService:
         except Exception as exc:  # noqa: BLE001 - a full buffer is not a crash
             log.debug("Could not buffer the unsent %s (%s)", payload.get("type"), exc)
 
+    def _publish_attention(self, attention: list[dict[str, Any]]) -> None:
+        """ТЗ F-311: сказать хабу о ПОЯВИВШЕМСЯ объекте внимания и его зоне.
+
+        Событие рождается на переходе «пары (объект, зона) не было — пара
+        появилась», поэтому правило дома не срабатывает каждые полсекунды.
+        Комната не выдумывает зону: её посчитал `_detect` по полигонам дома
+        (F-309), а объект, попавший в маску, сюда вообще не доходит.
+        """
+        if not self.privacy.allows_frames:
+            # ТЗ F-303: приватный режим — камера не смотрит, и событий нет.
+            return
+        try:
+            current = {(str(item.get('label') or ''), str(item.get('zone') or ''))
+                       for item in attention or [] if str(item.get('label') or '')}
+        except (TypeError, AttributeError):
+            return
+        previous = getattr(self, '_attention_seen', set())
+        self._attention_seen = current
+        for item in attention or []:
+            label = str(item.get('label') or '')
+            key = (label, str(item.get('zone') or ''))
+            if not label or key in previous:
+                continue
+            self._submit(self._send_object_event(label, key[1], item.get('conf')))
+
+    async def _send_object_event(self, label: str, zone: str, confidence: Any) -> None:
+        """One ``object_event`` frame (ТЗ F-311): что, где и насколько уверенно."""
+        send_json = self._send_json
+        if send_json is None:
+            return
+        payload = {
+            "type": MSG_OBJECT_EVENT,
+            "label": str(label)[:40],
+            "zone": str(zone or "")[:120],
+            "conf": round(_as_float(confidence, 0.0), 3),
+            "at_ms": int(time.time() * 1000),
+            "event_id": new_ulid(),
+        }
+        try:
+            await send_json(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead socket is normal here
+            self._note_send_failure("object_event", exc)
+
     def _publish_tracks(self) -> None:
         """ТЗ F-201: the room's own person tracks, in their own message.
 
@@ -1072,6 +1440,12 @@ class CameraService:
         if not self.privacy.allows_frames:
             return
         reports = list(getattr(self, '_track_reports', []))
+        if any(report.event in {'entered', 'returned'} for report in reports):
+            # Somebody just walked in. A quick pass-by is over before the
+            # periodic presence push would carry a second frame, so the very
+            # next push goes out at once and carries the whole burst (see
+            # ``_maybe_push_presence``).
+            self._burst_due = True
         ids = tuple(sorted(report.track_id for report in reports))
         now = time.monotonic()
         if ids == self._sent_track_ids and now - self._sent_tracks_at < STATE_DEBOUNCE_S:
@@ -1099,6 +1473,14 @@ class CameraService:
             return
         if not self.privacy.allows_frames:
             return
+        try:
+            # ТЗ F-309: кроп — та же картинка комнаты, поэтому маска
+            # закрашивается до вырезки: иначе область «не анализировать»
+            # уехала бы в хаб внутри кропа.
+            frame = self._mask_frame(frame, self._cv2)
+        except CameraUnavailable as exc:
+            log.warning("Not sending body crops from this frame: %s", exc)
+            return
         now = time.monotonic()
         for report in list(getattr(self, '_track_reports', [])):
             x1, y1, x2, y2 = report.bbox
@@ -1122,8 +1504,11 @@ class CameraService:
             # audio. The next two-second window carries the same person.
             log.debug("Skipping a body crop - the socket is busy")
             return
+        masked_rev = self.masked_rev
         header = {"type": MSG_BODY_CROP, "track_id": track_id, "kind": "body",
-                  "w": int(width), "h": int(height)}
+                  "w": int(width), "h": int(height),
+                  # ТЗ F-309: маска закрашена до вырезки, хаб это проверяет.
+                  "masked": bool(masked_rev), "zones_rev": masked_rev}
         try:
             if lock is None:
                 await send_json(header)
@@ -1140,17 +1525,26 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_frame (SPEC v1.4)
     # ------------------------------------------------------------------
-    def _maybe_push_presence(self, frame=None) -> None:
+    def _maybe_push_presence(self, frame=None, frame_prefix: str = 'p') -> None:
         """Push a :data:`FACE_BURST`-frame burst while somebody is visible (v1.4 burst).
 
         JPEG encoding runs off the YOLO thread. At most one presence update is
         pending; its track boxes are captured together with its source frame.
+        A track that just appeared is not held back by the periodic interval:
+        somebody who crosses the room in half a second gets their frames taken
+        right then, and that push carries the whole :data:`FACE_BURST`.
+
+        :param frame_prefix: ``p`` for the detector's own pushes, ``q`` for the
+            light guard's (ТЗ F-201). The hub groups one burst by its frame id,
+            so two threads must never mint the same id.
         """
         now = time.monotonic()
         if not self.privacy.allows_frames:
             # ТЗ F-303: в приватном режиме не уходит даже «присутствие».
             return
-        if self._presence_pending.is_set() or now - self._last_presence_push < self.face_check_interval_s:
+        burst = bool(getattr(self, '_burst_due', False))
+        if self._presence_pending.is_set() or (
+                not burst and now - self._last_presence_push < self.face_check_interval_s):
             return
         lock = self._send_lock
         if lock is not None and lock.locked():
@@ -1161,24 +1555,38 @@ class CameraService:
             log.debug("Skipping a presence burst - the socket is busy")
             return
         self._last_presence_push = now
+        self._burst_due = False
+        # ТЗ F-201: a burst the light guard took carries the guard's own boxes -
+        # a person whose back is turned still counts as "somebody in the frame"
+        # for the hub's rules. The heavy detector's tracks win when it has any.
+        tracks = list(self._tracks) or list(getattr(self, '_quick_tracks', ()) or ())
+        self._quick_tracks = []
         self._frame_seq += 1
-        frame_id = f'p{self._frame_seq}'
+        frame_id = f'{frame_prefix}{self._frame_seq}'
         # ТЗ 4.5: an unprompted presence push is a background camera event too,
         # so the client mints its own event id for the burst.
         event_id = new_ulid()
         self._presence_pending.set()
-        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks),
-                                                       event_id)) is None:
+        if self._submit(self._encode_and_push_presence(frame, frame_id, tracks,
+                                                       event_id, burst=burst)) is None:
             self._presence_pending.clear()
 
-    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id=''):
+    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id='', burst=False):
         try:
             # full=True: face recognition needs a CRISP face. The old 1280px /
             # quality-80 presence frame made the owner's own face score around
             # the match threshold; a native-resolution frame fixes that at the
             # source instead of lowering the bar.
-            pairs = ([await asyncio.to_thread(self._encode, frame, full=True)] if frame is not None
-                     else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
+            if burst:
+                # A person who just appeared may be gone in half a second: the
+                # first push carries the whole burst the module promises, so
+                # the hub gets the several frames its identity and appearance
+                # confirmation asks for instead of one.
+                pairs = await asyncio.to_thread(self._capture_burst_sync, FACE_BURST, full=True)
+            else:
+                pairs = ([await asyncio.to_thread(self._encode, frame, full=True)]
+                         if frame is not None
+                         else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
             if pairs:
                 await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True,
                                        tracks=tracks, event_id=event_id)
@@ -1188,15 +1596,53 @@ class CameraService:
         finally:
             self._presence_pending.clear()
 
+    @staticmethod
+    def _frame_size(frame: Any) -> tuple[int, int]:
+        """``(width, height)`` кадра OpenCV; ``(0, 0)`` — если это не картинка."""
+        try:
+            return int(frame.shape[1]), int(frame.shape[0])
+        except (AttributeError, IndexError, TypeError):
+            return 0, 0
+
+    def _mask_frame(self, frame: Any, cv2: Any) -> Any:
+        """ТЗ F-309: закрасить области «не анализировать» ДО JPEG.
+
+        Копия обязательна: кадр приходит из кэша камеры, и затирание «на
+        месте» испортило бы следующую картинку (и кадр трекера). Если масок
+        нет, кадр возвращается как есть — без лишней копии и без изменений.
+
+        Закрашивание в чёрное, а не «вырезание»: JPEG не умеет дырок, а
+        чёрный прямоугольник гарантирует, что пикселей области в кадре нет.
+        Ошибка тут не «мелкая»: не закрасив маску, комната прислала бы то,
+        что владелец просил не смотреть, поэтому кадр не отправляется вовсе.
+        """
+        width, height = self._frame_size(frame)
+        polygons = mask_polygons(getattr(self, "_zones", ()), width, height)
+        if not polygons:
+            return frame
+        try:
+            import numpy as np
+
+            masked = frame.copy()
+            for polygon in polygons:
+                cv2.fillPoly(masked, [np.array(polygon, dtype=np.int32)], (0, 0, 0))
+            return masked
+        except Exception as exc:  # noqa: BLE001 - молчать о маске нельзя
+            raise CameraUnavailable(f"could not paint the frame mask: {exc}") from exc
+
     def _encode(self, frame: Any, full: bool = False) -> tuple[bytes, int, int]:
         """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80.
 
         :param full: v1.6 -- skip the downscale entirely for this frame
             (``find_object`` wants the detector to see native resolution).
+
+        ТЗ F-309: области «не анализировать» закрашиваются ЗДЕСЬ, до JPEG, —
+        иначе маска осталась бы обещанием, а не свойством кадра.
         """
         cv2 = self._cv2
         if cv2 is None:  # pragma: no cover - only reachable before the first frame
             raise CameraUnavailable("OpenCV is not loaded")
+        frame = self._mask_frame(frame, cv2)
         height, width = int(frame.shape[0]), int(frame.shape[1])
         if width <= 0 or height <= 0:
             raise CameraUnavailable("the camera returned an empty frame")
@@ -1240,6 +1686,10 @@ class CameraService:
             log.debug("Skipping a %s burst %s - the socket is busy", reason, frame_id)
             return
         total = len(pairs)
+        # ТЗ F-309: кадр уходит уже с закрашенными масками, и заголовок несёт
+        # отпечаток этих масок — хаб сверяет его со своим конфигом и
+        # отказывается анализировать кадр без маски.
+        masked_rev = self.masked_rev
         log.debug(
             "Sending a %s frame burst %s: %d frame(s)", reason, frame_id, total
         )
@@ -1250,7 +1700,7 @@ class CameraService:
                     frame_tracks = pair[3] if len(pair) > 3 else tracks
                     await self._send_pair(
                         send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
-                        frame_tracks, event_id
+                        frame_tracks, event_id, masked=bool(masked_rev), zones_rev=masked_rev
                     )
             else:
                 async with lock:
@@ -1259,7 +1709,7 @@ class CameraService:
                         frame_tracks = pair[3] if len(pair) > 3 else tracks
                         await self._send_pair(
                             send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
-                            frame_tracks, event_id
+                            frame_tracks, event_id, masked=bool(masked_rev), zones_rev=masked_rev
                         )
         except asyncio.CancelledError:
             raise
@@ -1279,6 +1729,8 @@ class CameraService:
         height: int,
         tracks=None,
         event_id: str = "",
+        masked: bool = False,
+        zones_rev: str = "",
     ) -> None:
         """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
@@ -1291,6 +1743,10 @@ class CameraService:
             "seq": int(seq),
             "of": int(total),
             "tracks": tracks,
+            # ТЗ F-309: маска уже закрашена в самом JPEG; заголовок говорит
+            # хабу, что именно проверять.
+            "masked": bool(masked),
+            "zones_rev": str(zones_rev or ""),
         }
         if event_id:
             # ТЗ 4.5: the background camera event keeps the id the server minted

@@ -24,6 +24,7 @@ import csv
 import ctypes
 import io
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -64,6 +65,19 @@ CMD_FOCUS_APP = "focus_app"
 CMD_TYPE_TEXT = "type_text"
 CMD_HOTKEY = "hotkey"
 CMD_SCROLL = "scroll"
+CMD_LOCK = "lock"
+CMD_UNLOCK = "unlock"
+CMD_MOVE_TO_MONITOR = "move_to_monitor"
+CMD_APP_VOLUME = "app_volume"
+CMD_CLIPBOARD_READ = "clipboard_read"
+CMD_CLIPBOARD_WRITE = "clipboard_write"
+CMD_CLIPBOARD_PASTE = "clipboard_paste"
+CMD_SHUTDOWN = "shutdown"
+
+#: ТЗ F-507: where this PC keeps the PIN it may type on the lock screen. The
+#: value is read only from this machine's environment (раздел 1 ТЗ: secrets in
+#: the environment), never from the hub and never written to a log.
+PIN_ENV = "ROWAN_PC_UNLOCK_PIN"
 
 PC_COMMANDS = frozenset(
     {
@@ -86,6 +100,14 @@ PC_COMMANDS = frozenset(
         CMD_TYPE_TEXT,
         CMD_HOTKEY,
         CMD_SCROLL,
+        CMD_LOCK,
+        CMD_UNLOCK,
+        CMD_MOVE_TO_MONITOR,
+        CMD_APP_VOLUME,
+        CMD_CLIPBOARD_READ,
+        CMD_CLIPBOARD_WRITE,
+        CMD_CLIPBOARD_PASTE,
+        CMD_SHUTDOWN,
     }
 )
 
@@ -140,11 +162,17 @@ RUN_COMMAND_OUTPUT_LIMIT = 4000
 #: upper bound for a single ``type_text`` action — a voice command never needs more
 MAX_TYPE_CHARS = 4000
 
+#: upper bound for one clipboard action (ТЗ F-511): a page of text, not a file.
+MAX_CLIPBOARD_CHARS = 4000
+
 #: how many SendInput events are pushed in one call while typing
 TYPE_CHUNK_EVENTS = 100
 
 #: pause between typing chunks so slower windows keep up
 TYPE_CHUNK_PAUSE_S = 0.005
+
+#: how long ``shutdown`` may take to accept the request (ТЗ F-511)
+SHUTDOWN_TIMEOUT_S = 15.0
 
 # --- Win32 constants ---------------------------------------------------------
 _INPUT_MOUSE = 0
@@ -206,6 +234,11 @@ VK_DOWN = 0x28
 VK_DELETE = 0x2E
 VK_LWIN = 0x5B
 VK_F1 = 0x70
+#: ``V`` — the key Ctrl+V sends (ТЗ F-511, clipboard_paste).
+_VK_V = 0x56
+
+#: ``OpenInputDesktop`` access flag: the desktop that receives our keystrokes.
+DESKTOP_SWITCHDESKTOP = 0x0100
 
 _HWND_BROADCAST = 0xFFFF
 _WM_SYSCOMMAND = 0x0112
@@ -324,6 +357,50 @@ class _INPUT(ctypes.Structure):
 _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
+class _MONITORINFOEXW(ctypes.Structure):
+    """``MONITORINFOEXW`` — the monitor rect and device name (ТЗ F-511)."""
+
+    _fields_ = (
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    )
+
+
+#: EnumDisplayMonitors callback: ``BOOL (HMONITOR, HDC, LPRECT, LPARAM)``
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HANDLE, wintypes.HDC, ctypes.POINTER(wintypes.RECT),
+    wintypes.LPARAM)
+
+#: ``MONITORINFOF_PRIMARY`` — Windows' own mark of the main display.
+_MONITORINFOF_PRIMARY = 0x1
+
+#: ``SetWindowPos`` flags: move without re-stacking or stealing focus.
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+
+
+class _MonitorInfo(NamedTuple):
+    """One display: its handle, virtual-screen rect and whether it is primary."""
+
+    handle: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+    primary: bool
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+
 class _WindowInfo(NamedTuple):
     """One visible top-level window found by :func:`_list_windows`."""
 
@@ -382,6 +459,39 @@ def _user32() -> Any:
             dll.SetCursorPos.restype = wintypes.BOOL
             dll.GetSystemMetrics.argtypes = (ctypes.c_int,)
             dll.GetSystemMetrics.restype = ctypes.c_int
+            # locking / typing on the lock screen (ТЗ F-507)
+            dll.LockWorkStation.argtypes = ()
+            dll.LockWorkStation.restype = wintypes.BOOL
+            dll.OpenInputDesktop.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            dll.OpenInputDesktop.restype = wintypes.HANDLE
+            dll.CloseDesktop.argtypes = (wintypes.HANDLE,)
+            dll.CloseDesktop.restype = wintypes.BOOL
+            # monitors and window geometry (ТЗ F-511, window_to_monitor)
+            dll.EnumDisplayMonitors.argtypes = (
+                wintypes.HDC, ctypes.POINTER(wintypes.RECT), _MONITORENUMPROC,
+                wintypes.LPARAM)
+            dll.EnumDisplayMonitors.restype = wintypes.BOOL
+            dll.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+            dll.GetMonitorInfoW.restype = wintypes.BOOL
+            dll.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+            dll.GetWindowRect.restype = wintypes.BOOL
+            dll.SetWindowPos.argtypes = (
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT)
+            dll.SetWindowPos.restype = wintypes.BOOL
+            # clipboard (ТЗ F-511: буфер обмена — прочитать, вставить)
+            dll.OpenClipboard.argtypes = (wintypes.HWND,)
+            dll.OpenClipboard.restype = wintypes.BOOL
+            dll.CloseClipboard.argtypes = ()
+            dll.CloseClipboard.restype = wintypes.BOOL
+            dll.EmptyClipboard.argtypes = ()
+            dll.EmptyClipboard.restype = wintypes.BOOL
+            dll.IsClipboardFormatAvailable.argtypes = (wintypes.UINT,)
+            dll.IsClipboardFormatAvailable.restype = wintypes.BOOL
+            dll.GetClipboardData.argtypes = (wintypes.UINT,)
+            dll.GetClipboardData.restype = wintypes.HANDLE
+            dll.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+            dll.SetClipboardData.restype = wintypes.HANDLE
             _user32_dll = dll
         return _user32_dll
 
@@ -595,6 +705,125 @@ def _sync_set_mute(muted: bool) -> None:
         volume.SetMute(1 if muted else 0, None)
 
 
+def _session_process_name(session: Any) -> str:
+    """The exe name behind one audio session, as pycaw spells it."""
+    process = getattr(session, 'Process', None)
+    if process is not None:
+        name = getattr(process, 'name', None)
+        try:
+            value = name() if callable(name) else name
+        except Exception:  # noqa: BLE001 - a dead process must not stop the search
+            value = ''
+        if value:
+            return str(value)
+    return str(getattr(session, 'ProcessName', '') or '')
+
+
+def _session_volume(process: str) -> Any:
+    """``ISimpleAudioVolume`` of one app's audio session (ТЗ F-511)."""
+    try:
+        from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - depends on the install
+        raise PCActionError(
+            "the pycaw library is missing (pip install comtypes pycaw)"
+        ) from exc
+
+    wanted = normalize_app_name(process)
+    if not wanted:
+        raise PCActionError("app_volume needs the application name")
+    known: list[str] = []
+    for session in AudioUtilities.GetAllSessions():
+        name = _session_process_name(session)
+        if name:
+            known.append(name)
+        if name and normalize_app_name(name) == wanted:
+            control = getattr(session, '_ctl', None)
+            if control is None:
+                continue
+            return control.QueryInterface(ISimpleAudioVolume)
+    hint = ", ".join(sorted(set(known))[:6])
+    raise PCActionError(
+        f"{process!r} has no audio session right now"
+        + (f" (playing: {hint})" if hint else ""))
+
+
+def _sync_app_volume(process: str, scalar: float) -> float:
+    with _com_apartment():
+        volume = _session_volume(process)
+        level = _clamp_scalar(scalar)
+        volume.SetMasterVolume(level, None)
+        if level > 0.0:
+            volume.SetMute(0, None)
+        return level
+
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+def _sync_clipboard_read() -> str:
+    """The clipboard as text; ``""`` when it holds none (ТЗ F-511)."""
+    _require_windows()
+    user32 = _user32()
+    kernel32 = ctypes.windll.kernel32
+    if not user32.OpenClipboard(None):
+        raise PCActionError("could not open the clipboard")
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return ""
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return ctypes.c_wchar_p(pointer).value or ""
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _sync_clipboard_write(text: str) -> None:
+    """Put ``text`` on the clipboard (the second half of «прочитать/вставить»)."""
+    _require_windows()
+    user32 = _user32()
+    kernel32 = ctypes.windll.kernel32
+    data = str(text or "")
+    size = (len(data) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+    if not handle:
+        raise PCActionError("could not allocate clipboard memory")
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    pointer = kernel32.GlobalLock(handle)
+    if not pointer:
+        kernel32.GlobalFree(handle)
+        raise PCActionError("could not lock clipboard memory")
+    try:
+        ctypes.memmove(pointer, ctypes.create_unicode_buffer(data), size)
+    finally:
+        kernel32.GlobalUnlock(handle)
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        raise PCActionError("could not open the clipboard")
+    try:
+        if not user32.EmptyClipboard():
+            raise PCActionError("could not empty the clipboard")
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            raise PCActionError("could not put the text on the clipboard")
+    finally:
+        user32.CloseClipboard()
+
+
+def _sync_clipboard_paste() -> None:
+    """Press Ctrl+V in whatever window holds the focus."""
+    _sync_hotkey([VK_CONTROL], [(_VK_V, False)])
+
+
 def _sync_media_key(vk: int) -> None:
     # media keys are extended keys on a PC/AT keyboard
     _send_input(_key_event(vk, key_up=False, extended=True), _key_event(vk, key_up=True, extended=True))
@@ -625,6 +854,59 @@ def _sync_suspend() -> None:
         raise PCActionError(
             f"SetSuspendState failed (error code {ctypes.get_last_error()})"
         )
+
+
+def _sync_shutdown() -> None:
+    """Shut this PC down (ТЗ F-511) — only after the hub's spoken yes (F-113)."""
+    _require_windows()
+    try:
+        completed = subprocess.run(
+            ["shutdown", "/s", "/t", "0"],
+            capture_output=True, text=True, timeout=SHUTDOWN_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PCActionError(f"could not shut the PC down: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()[:200]
+        raise PCActionError(
+            f"shutdown failed (exit code {completed.returncode})"
+            + (f": {detail}" if detail else ""))
+
+
+def unlock_pin() -> str:
+    """ТЗ F-507: the PIN this PC may type, from ITS OWN environment only."""
+    return str(os.environ.get(PIN_ENV) or "").strip()
+
+
+def _sync_lock() -> None:
+    """Lock the workstation — the same call Win+L makes (ТЗ F-507)."""
+    user32 = _user32()
+    if not user32.LockWorkStation():
+        raise PCActionError(f"LockWorkStation failed (error code {ctypes.get_last_error()})")
+
+
+def _sync_unlock(pin: str) -> None:
+    """Type the locally stored PIN on the lock screen and press Enter (F-507).
+
+    Windows Hello cannot be emulated (раздел 17 ТЗ), so the variant the ТЗ
+    allows is auto-typing the PIN the owner stored on THIS machine. The
+    keystrokes must reach the input desktop: a client that cannot open it (the
+    ordinary case while Windows sits on the Winlogon desktop) says so instead
+    of pretending the PC unlocked.
+    """
+    _require_windows()
+    user32 = _user32()
+    handle = user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    if not handle:
+        raise PCActionError(
+            "this process cannot type into the lock screen of this PC "
+            "(the client needs access to the input desktop)"
+        )
+    user32.CloseDesktop(handle)
+    events = _text_events(pin)
+    events.append(_key_event(VK_RETURN, key_up=False))
+    events.append(_key_event(VK_RETURN, key_up=True))
+    _send_input_batch(events)
 
 
 def _text_events(text: str) -> list[_INPUT]:
@@ -1132,6 +1414,98 @@ def _sync_maximize_app(image_name: str | None, display_name: str) -> str | None:
     return targets[0].title
 
 
+def _app_windows(image_name: str | None, display_name: str) -> list[_WindowInfo]:
+    """The visible windows of an app: by process id first, by caption second.
+
+    The same rule :func:`_sync_focus_app` and :func:`_sync_minimize_app` use —
+    desktop apps are found by their process, Store/UWP apps by their title.
+    """
+    _require_windows()
+    pids = _sync_process_ids(image_name) if image_name else set()
+    windows = _list_windows()
+    targets = [window for window in windows if window.pid in pids] if pids else []
+    if not targets:
+        query = normalize_app_name(display_name)
+        targets = [window for window in windows if _title_matches(window.title, query)]
+    return targets
+
+
+def _foreground_window() -> _WindowInfo | None:
+    """The window the user is looking at, or ``None`` when there is none."""
+    _require_windows()
+    user32 = _user32()
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    length = int(user32.GetWindowTextLengthW(hwnd))
+    buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+    user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return _WindowInfo(hwnd=int(hwnd), pid=0, title=str(buffer.value))
+
+
+def _list_monitors() -> list[_MonitorInfo]:
+    """Every display, numbered the way the hub speaks about them (F-511).
+
+    Windows itself does not give monitors an index, so the number is this
+    client's own stable order: left to right, then top to bottom of the virtual
+    screen (``DECISIONS.md`` P3-36). The primary display is marked and never
+    depends on that order.
+    """
+    _require_windows()
+    user32 = _user32()
+    monitors: list[_MonitorInfo] = []
+
+    @_MONITORENUMPROC
+    def collect(hmonitor: Any, _hdc: Any, _rect: Any, _data: Any) -> bool:
+        try:
+            info = _MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+            if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                area = info.rcMonitor
+                monitors.append(_MonitorInfo(
+                    handle=int(hmonitor), left=int(area.left), top=int(area.top),
+                    right=int(area.right), bottom=int(area.bottom),
+                    primary=bool(int(info.dwFlags) & _MONITORINFOF_PRIMARY)))
+        except Exception as exc:  # noqa: BLE001 - a bad monitor must not stop the rest
+            log.debug("Could not read a monitor: %s", exc)
+        return True
+
+    user32.EnumDisplayMonitors(None, None, collect, 0)
+    monitors.sort(key=lambda item: (item.left, item.top))
+    return monitors
+
+
+def _sync_window_to_monitor(image_name: str | None, display_name: str,
+                            number: int) -> str | None:
+    """Move the app's window onto monitor ``number``; returns its title."""
+    monitors = _list_monitors()
+    if not monitors:
+        raise PCActionError("no monitors were found on this PC")
+    if number < 1 or number > len(monitors):
+        raise PCActionError(
+            f"this PC has {len(monitors)} monitor(s); monitor {number} does not exist")
+    targets = (_app_windows(image_name, display_name) if (image_name or display_name)
+               else [window for window in (_foreground_window(),) if window is not None])
+    if not targets:
+        return None
+    window = targets[0]
+    user32 = _user32()
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(window.hwnd, ctypes.byref(rect)):
+        raise PCActionError(f"could not read the window rect of {window.title!r}")
+    target = monitors[number - 1]
+    width = min(max(200, int(rect.right - rect.left)), target.width)
+    height = min(max(150, int(rect.bottom - rect.top)), target.height)
+    x = target.left + max(0, (target.width - width) // 2)
+    y = target.top + max(0, (target.height - height) // 2)
+    if not user32.SetWindowPos(window.hwnd, None, x, y, width, height,
+                               _SWP_NOZORDER | _SWP_NOACTIVATE):
+        raise PCActionError(f"could not move {window.title!r} to monitor {number}")
+    return window.title
+
+
 def _own_console_focused() -> bool:
     """True when the foreground window is the console hosting this client."""
     try:
@@ -1245,6 +1619,18 @@ def parse_mouse_button(value: Any) -> str:
 # --- controller --------------------------------------------------------------
 
 
+def _parse_monitor_number(value: Any) -> int:
+    """The monitor number a command names: 1 is the leftmost display (F-511)."""
+    if isinstance(value, bool) or value is None:
+        raise PCActionError("move_to_monitor needs the monitor number in 'value'")
+    text = str(value).strip()
+    digits = "".join(char for char in text if char.isdigit())
+    if not digits:
+        raise PCActionError(
+            f"unclear monitor number {value!r}: name the display, for example 2")
+    return max(1, int(digits))
+
+
 def _parse_volume_value(value: Any) -> int:
     if value is None or (isinstance(value, str) and not value.strip()):
         raise PCActionError("volume_set needs a level between 0 and 100")
@@ -1285,7 +1671,7 @@ class PCController:
 
     # -- pc_control ---------------------------------------------------------
 
-    async def execute(self, command: Any, value: Any = None) -> PCResult:
+    async def execute(self, command: Any, value: Any = None, target: Any = None) -> PCResult:
         """Run one ``pc_control`` command. Raises :class:`PCActionError` on failure."""
 
         name = command.strip().casefold() if isinstance(command, str) else ""
@@ -1331,8 +1717,84 @@ class PCController:
         if name == CMD_SLEEP:
             return PCResult(await self._suspend())
 
+        if name == CMD_LOCK:
+            await asyncio.to_thread(_sync_lock)
+            log.info("pc_control: the PC is locked")
+            return PCResult("the PC is locked")
+
+        if name == CMD_SHUTDOWN:
+            await asyncio.to_thread(_sync_shutdown)
+            log.info("pc_control: the PC is shutting down")
+            return PCResult("the PC is shutting down")
+
+        if name == CMD_UNLOCK:
+            pin = unlock_pin()
+            if not pin:
+                raise PCActionError(
+                    f"no unlock PIN is stored on this PC (set {PIN_ENV} on the client)")
+            if not (pin.isdigit() and 4 <= len(pin) <= 12):
+                raise PCActionError("the stored unlock PIN must be 4 to 12 digits")
+            await asyncio.to_thread(_sync_unlock, pin)
+            # Честно: PIN набран, но отпирание проверить отсюда нельзя.
+            log.info("pc_control: the stored PIN was typed on the lock screen")
+            return PCResult("the PIN was typed on the lock screen")
+
         if name == CMD_TYPE_TEXT:
             return await self._type_text(value)
+
+        if name == CMD_MOVE_TO_MONITOR:
+            number = _parse_monitor_number(value)
+            app = str(target or '').strip()
+            if app:
+                entry = await self._resolve_app(app)
+                image_name, display_name = entry.process_name(), entry.name
+            else:
+                image_name, display_name = None, ""
+            title = await asyncio.to_thread(
+                _sync_window_to_monitor, image_name, display_name, number)
+            if title is None:
+                raise PCActionError(
+                    f"{app} has no window open to move" if app
+                    else "no window is in the foreground to move")
+            return PCResult(f"moved {title!r} to monitor {number}")
+
+        if name == CMD_APP_VOLUME:
+            level = _parse_volume_value(value)
+            app = str(target or '').strip()
+            if not app:
+                raise PCActionError("app_volume needs the application name in 'target'")
+            entry = await self._resolve_app(app)
+            actual = await asyncio.to_thread(
+                _sync_app_volume, entry.process_name() or entry.name, level / 100.0)
+            return PCResult(f"{app} volume {int(round(actual * 100))}%")
+
+        if name == CMD_CLIPBOARD_READ:
+            text = await asyncio.to_thread(_sync_clipboard_read)
+            shown = text[:MAX_CLIPBOARD_CHARS]
+            return PCResult(f"clipboard: {len(text)} character(s)",
+                            shown if shown else None)
+
+        if name == CMD_CLIPBOARD_WRITE:
+            text = "" if value is None else str(value)
+            if not text:
+                raise PCActionError("clipboard_write needs the text in 'value'")
+            if len(text) > MAX_CLIPBOARD_CHARS:
+                raise PCActionError(
+                    f"clipboard_write got {len(text)} characters, the limit is "
+                    f"{MAX_CLIPBOARD_CHARS}")
+            await asyncio.to_thread(_sync_clipboard_write, text)
+            return PCResult(f"put {len(text)} character(s) on the clipboard")
+
+        if name == CMD_CLIPBOARD_PASTE:
+            if value is not None and str(value):
+                text = str(value)
+                if len(text) > MAX_CLIPBOARD_CHARS:
+                    raise PCActionError(
+                        f"clipboard_paste got {len(text)} characters, the limit is "
+                        f"{MAX_CLIPBOARD_CHARS}")
+                await asyncio.to_thread(_sync_clipboard_write, text)
+            await asyncio.to_thread(_sync_clipboard_paste)
+            return PCResult("pasted on the focused window")
 
         if name == CMD_HOTKEY:
             return await self._hotkey(value)
@@ -1587,6 +2049,7 @@ __all__ = [
     "BUTTON_RIGHT",
     "MODIFIER_KEYS",
     "MOUSE_BUTTONS",
+    "MAX_CLIPBOARD_CHARS",
     "NAMED_KEYS",
     "PC_COMMANDS",
     "PCActionError",
@@ -1594,6 +2057,7 @@ __all__ = [
     "PCResult",
     "RUN_COMMAND_OUTPUT_LIMIT",
     "RUN_COMMAND_TIMEOUT_S",
+    "SHUTDOWN_TIMEOUT_S",
     "parse_click_coordinate",
     "parse_hotkey",
     "parse_mouse_button",

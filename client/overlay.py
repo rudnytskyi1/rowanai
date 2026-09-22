@@ -304,7 +304,7 @@ def _visibility_now(owner: Any, now: float) -> bool:
         now < owner._flash_until,
         now < owner._click_until,
         now < getattr(owner, "_badge_until", 0.0),
-    )
+    ) or bool(getattr(owner, "_control", ""))
 
 
 class OverlayHUD:
@@ -355,6 +355,9 @@ class OverlayHUD:
         #: ТЗ F-303: the camera is off (privacy mode) — a permanent badge, not
         #: a passing status: the room must be able to see it at a glance.
         self._camera_off = ""
+        #: ТЗ F-512: «Rowan управляет» — пока агент водит мышью и печатает,
+        #: это видно на экране; пусто — агент не трогает ПК.
+        self._control = ""
         #: Until when those badges may hold the window up on their own. They
         #: stay in the page's snapshot, but only this long as a reason to keep
         #: a transparent overlay over the owner's desktop (BADGE_HOLD_S).
@@ -482,6 +485,19 @@ class OverlayHUD:
             return
         self._camera_off = _truncate_status(text)
         self._post(lambda bridge: bridge.camera_changed.emit(self._camera_off))
+
+    def control(self, text: Any) -> None:
+        """ТЗ F-512: the «Rowan is in control» badge; ``""`` clears it.
+
+        Unlike the camera-off badge, this one is NOT time-boxed: while the agent
+        drives the mouse and the keyboard the badge must stay up, and the run is
+        bounded by its own 15-step limit anyway. An empty string takes it down
+        the instant the run ends or the person says «стоп».
+        """
+        if not self.enabled:
+            return
+        self._control = _truncate_status(text)
+        self._post(lambda bridge: bridge.control_changed.emit(self._control))
 
     def followup_window(self, seconds: Any) -> None:
         """Show the follow-up window draining (ТЗ F-103); ``0`` closes it.
@@ -730,6 +746,7 @@ class OverlayHUD:
             status_changed = Signal(str)
             warning_changed = Signal(str)
             camera_changed = Signal(str)
+            control_changed = Signal(str)
             followup_changed = Signal(float)
             scan_changed = Signal(bool)
             typing_changed = Signal(bool)
@@ -756,6 +773,7 @@ class OverlayHUD:
                 self.status_changed.connect(self._on_status)
                 self.warning_changed.connect(self._on_warning)
                 self.camera_changed.connect(self._on_camera)
+                self.control_changed.connect(self._on_control)
                 self.followup_changed.connect(self._on_followup)
                 self.scan_changed.connect(self._on_scan)
                 self.typing_changed.connect(self._on_typing)
@@ -843,6 +861,7 @@ class OverlayHUD:
                         "status": owner._status,
                         "warning": owner._warning,
                         "camera_off": owner._camera_off,
+                        "control": owner._control,
                         "typing": owner._typing_on,
                         "scan": owner._scanning,
                     }
@@ -961,6 +980,17 @@ class OverlayHUD:
                 self._reconsider_visibility()
                 if owner._badge_until:
                     QTimer.singleShot(int(BADGE_HOLD_S * 1000) + 50, self._maybe_hide)
+
+            def _on_control(self, text: str) -> None:
+                """ТЗ F-512: «Rowan управляет» — стоячий значок, не момент.
+
+                Пока агент водит мышью, комната обязана это видеть; поэтому
+                значок НЕ ограничен ``BADGE_HOLD_S``, как F-102/F-303, — его
+                снимает конец прогона (сообщение хаба или «стоп» в комнате).
+                """
+                owner._control = text
+                self._sync_state()
+                self._reconsider_visibility()
 
             def _on_followup(self, seconds: float) -> None:
                 """Draw the window draining, one tick per quarter second."""
