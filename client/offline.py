@@ -20,6 +20,14 @@ from typing import Any
 
 #: ТЗ 4.8: «потеря соединения дольше 3 с» — тогда экран говорит «мозг оффлайн».
 OFFLINE_AFTER_S = 3.0
+#: A hub restart takes about half a minute. The room should show the offline
+#: badge at once, but it must not SPEAK the line every time the server is
+#: restarted: the owner asked for a quiet restart, so the voice waits for an
+#: outage that a restart cannot explain. Configure `notice_after_s` to taste.
+OFFLINE_NOTICE_AFTER_S = 60.0
+#: A lost link is not an error the room must hear about: the beep was noise
+#: every time the hub was restarted. Speaks/warns on the screen instead.
+OFFLINE_BEEP_ON_LINK_LOSS = False
 #: Экспоненциальная задержка реконнекта: первая попытка, множитель и потолок.
 BACKOFF_BASE_S = 1.0
 BACKOFF_FACTOR = 2.0
@@ -77,6 +85,12 @@ class OfflineMode:
     def __init__(self, cfg: Any = None, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.enabled = bool(getattr(cfg, "enabled", True))
         self.after_s = float(getattr(cfg, "after_s", OFFLINE_AFTER_S) or OFFLINE_AFTER_S)
+        self.notice_after_s = float(
+            getattr(cfg, "notice_after_s", OFFLINE_NOTICE_AFTER_S) or OFFLINE_NOTICE_AFTER_S)
+        #: The link-loss beep is off by default: a hub restart was making the
+        #: room beep twice for no reason the people in it could act on.
+        self.beep_on_link_loss = bool(
+            getattr(cfg, "beep_on_link_loss", OFFLINE_BEEP_ON_LINK_LOSS))
         self.base_s = float(getattr(cfg, "backoff_base_s", BACKOFF_BASE_S) or BACKOFF_BASE_S)
         self.factor = float(getattr(cfg, "backoff_factor", BACKOFF_FACTOR) or BACKOFF_FACTOR)
         self.max_s = float(getattr(cfg, "backoff_max_s", BACKOFF_MAX_S) or BACKOFF_MAX_S)
@@ -85,6 +99,7 @@ class OfflineMode:
         #: already been told about THIS outage.
         self._down_since: float | None = None
         self._announced = False
+        self._spoke = False
         self._attempt = 0
 
     # -- link state -------------------------------------------------------
@@ -93,6 +108,7 @@ class OfflineMode:
         """The hub answered: the outage (if any) is over."""
         self._down_since = None
         self._announced = False
+        self._spoke = False
         self._attempt = 0
 
     def link_down(self, *, at: float | None = None) -> None:
@@ -115,7 +131,7 @@ class OfflineMode:
     # -- what the room hears ----------------------------------------------
 
     def take_notice(self) -> bool:
-        """``True`` once per outage, when the room must be told (ТЗ 4.8)."""
+        """``True`` once per outage, when the SCREEN must show the badge (ТЗ 4.8)."""
         if not self.offline() or self._announced:
             return False
         self._announced = True
@@ -123,6 +139,24 @@ class OfflineMode:
 
     def announced(self) -> bool:
         return self._announced
+
+    def notice_due(self) -> bool:
+        """True once the outage is long enough to be worth saying out loud.
+
+        The badge appears after ``after_s`` (3 s, ТЗ 4.8), but the spoken line
+        waits for ``notice_after_s``: a restart of the hub takes about half a
+        minute, and a room that announces every restart talks to itself.
+        """
+        if not self.enabled or self._down_since is None:
+            return False
+        return self.down_s() >= max(self.after_s, self.notice_after_s)
+
+    def take_voice_notice(self) -> bool:
+        """``True`` once per outage, when the room must be TOLD OUT LOUD."""
+        if not self.notice_due() or self._spoke:
+            return False
+        self._spoke = True
+        return True
 
     # -- coming back ------------------------------------------------------
 

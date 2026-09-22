@@ -368,6 +368,9 @@ class OverlayHUD:
         self._flash_until = 0.0
         self._click_until = 0.0
         self._mapped = False
+        #: Native handle of this window, so the detections photo can ask to be
+        #: placed directly BELOW it instead of racing it for the top slot.
+        self._hwnd: int | None = None
         self._capture_suspended = False
         #: Until when the HUD re-asserts itself above other topmost windows.
         #: The detections photo re-pins itself on every pump, so a HUD that
@@ -628,6 +631,22 @@ class OverlayHUD:
             window = 0.0
         self._top_guard_until = max(self._top_guard_until, time.monotonic() + window)
         self._post(lambda bridge: bridge.raise_requested.emit())
+
+    def window_handle(self) -> int | None:
+        """Native handle of the HUD window, or ``None`` while it has none.
+
+        The detections photo (``client/viewer.py``) is always-on-top too, and
+        two windows that both re-assert topmost flicker while they trade the
+        top slot. The photo therefore asks to be inserted directly BELOW this
+        handle (``viewer.set_overlay_window``) instead of racing it. Safe to
+        call from any thread: it only reads an int stored by the Qt thread.
+        """
+        value = getattr(self, "_hwnd", None)
+        try:
+            handle = int(value) if value else 0
+        except (TypeError, ValueError):
+            return None
+        return handle or None
 
     def hide_now(self) -> None:
         """Take the window off screen immediately, skipping the fade-out delay.
@@ -1048,6 +1067,10 @@ class OverlayHUD:
         url.setQuery(f"scale={self.scale}")
         view.load(url)
         view.hide()
+        try:
+            owner._hwnd = int(view.winId())
+        except Exception:  # noqa: BLE001 - the HUD works without a native handle
+            owner._hwnd = None
 
         # Defense in depth: hide/ack is still mandatory on every capture.
         try:

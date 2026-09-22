@@ -560,6 +560,13 @@ class JarvisClient:
         else:
             log.debug("The overlay HUD is not importable: %s", _OVERLAY_IMPORT_ERROR)
             self.overlay = _NoOverlay()
+        # The detections photo is always-on-top too. Telling the viewer which
+        # window to stay below is what stops the HUD and the photo from
+        # flickering as they trade the top slot (see client/viewer.py).
+        if self.viewer is not None:
+            register = getattr(self.viewer, "set_overlay_window", None)
+            if callable(register):
+                register(self.overlay.window_handle)
         #: The image_show header awaiting its single binary JPEG frame.
         self._pending_image_show: dict[str, Any] | None = None
         #: ТЗ F-708: the track labels drawn over the shown photo, and a token
@@ -755,7 +762,8 @@ class JarvisClient:
                     # экране, и голосом (см. ``_offline_loop``).
                     self.offline.link_down()
                     self._start_reconnect()
-                    await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS)
+                    if self.offline.beep_on_link_loss:
+                        await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS)
         finally:
             await self._shutdown()
 
@@ -831,7 +839,9 @@ class JarvisClient:
             if not self._link_alive():
                 self.offline.link_down()
                 if self.offline.take_notice():
-                    await self._enter_offline_mode()
+                    self._show_offline_badge()
+                if self.offline.take_voice_notice():
+                    await self._say_offline_notice()
             await asyncio.sleep(OFFLINE_POLL_S)
 
     async def _before_retry(self, delay_s: float, attempt: int) -> None:
@@ -848,11 +858,15 @@ class JarvisClient:
     async def _enter_offline_mode(self) -> None:
         """Once per outage: «мозг оффлайн» на экране и голосом (ТЗ 4.8)."""
         log.info("The hub has been away for %.1f s - working locally", self.offline.down_s())
+        self._show_offline_badge()
+        await self._say_offline_notice()
+
+    def _show_offline_badge(self) -> None:
+        """The screen says the brain is away; the voice notice may lag behind."""
         try:
             self.overlay.hub_state({"state": "offline"})
         except Exception as exc:  # noqa: BLE001 - the HUD is never worth a crash
             log.debug("Could not show the offline badge: %s", exc)
-        await self._say_offline_notice()
 
     async def _say_offline_notice(self) -> None:
         """Say the pre-synthesized line; without cached audio, show it."""

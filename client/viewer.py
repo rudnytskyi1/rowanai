@@ -59,6 +59,38 @@ _SWP_NOSIZE = 0x0001
 _SWP_FRAMECHANGED = 0x0020
 _SWP_SHOWWINDOW = 0x0040
 _SWP_NOACTIVATE = 0x0010
+
+#: The window the photo must stay UNDER when one exists: the HUD overlay.
+#: ``client.main`` registers the overlay's native handle here once the HUD is
+#: up; with no overlay the photo goes plain topmost, exactly as before.
+_UNDER_WINDOW: Any = None
+
+
+def set_overlay_window(source: Any) -> None:
+    """Register the HUD window - a handle, or a callable returning one.
+
+    Two always-on-top windows that both re-assert topmost flicker while they
+    trade the top slot: the photo re-pins itself on every message-loop pump
+    (``POLL_S``), the HUD re-raises itself on its own guard timer. Inserting
+    the photo directly below the HUD settles the order without a race.
+    """
+    global _UNDER_WINDOW
+    _UNDER_WINDOW = source
+
+
+def _bottom_of() -> int:
+    """The handle to insert the photo below, ``0`` when there is none."""
+    source = _UNDER_WINDOW
+    if source is None:
+        return 0
+    try:
+        value = source() if callable(source) else source
+    except Exception:  # noqa: BLE001 - a broken provider must not hide the photo
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 _SW_RESTORE = 9
 _viewers = weakref.WeakSet()
 _viewers_lock = threading.Lock()
@@ -214,9 +246,19 @@ def _keep_on_top(window_name: str) -> None:
         hwnd = user32.FindWindowW(None, window_name)
         if not hwnd:
             return
+        after = _bottom_of()
+        if after:
+            # The HUD overlay is on top of us by design: inserting the photo
+            # directly BELOW its window keeps the badge and the transcript
+            # readable instead of trading the top slot with it every pump.
+            try:
+                if not user32.IsWindow(after):
+                    after = 0
+            except Exception:  # noqa: BLE001 - an unusable probe means topmost
+                after = 0
         user32.SetWindowPos(
             hwnd,
-            _HWND_TOPMOST,
+            after or _HWND_TOPMOST,
             0,
             0,
             0,
