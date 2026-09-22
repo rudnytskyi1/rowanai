@@ -14,7 +14,7 @@
     "client/actions/photos.py": "f0ed6720bb0b8aa9d1dddfb71a2358fc3dcde980fd69c580dcaa88ab0dfe2a10",
     "client/actions/wallpaper.py": "8ccb8ad63ddc7f9ae415be6ecf363645ed3fc1a46b6326194ae226390b63f284",
     "client/attention.py": "ad2749343507f7ca98b3e62f8174fdbb01c71cbf256370075859b335935a9599",
-    "client/audio.py": "e4a62cedb5aa21222be57d8c0f555110af4c58907ce42fdd1e66f4f1cbe9b0ff",
+    "client/audio.py": "07e0071aa96d54e656d0436ea042e814438700b52135cf5a8fa1ec1894f8bc53",
     "client/audio_processing.py": "0346ccc44c94ddd9caa85d43587227d9254f66ee71d04ffea38426dc5916c00a",
     "client/barge_in.py": "8602e5b9c2d61b49cd4b03ad3656b95ab7bd494b1d2a2463d222324efeda7eb8",
     "client/body_crops.py": "4aa30b05d1e8453cc3aaf2d6734051d57aad5ad5901bda7ecce7e19f5575c91c",

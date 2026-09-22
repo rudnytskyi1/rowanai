@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 SAMPLE_WIDTH = 2
 #: Default capture frame length in milliseconds (webrtcvad accepts 10/20/30).
 FRAME_MS = 30
+#: Rates to try, in this order, when a device refuses the pipeline's own rate.
+#: 48 kHz first: that is what Windows headsets and USB microphones normally
+#: advertise, and capturing there costs one cheap linear resample in the
+#: PortAudio callback instead of a client that does not start at all.
+FALLBACK_RATES = (48000, 44100, 32000, 16000, 8000)
 #: Ack beep parameters (SPEC §7 step 2).
 BEEP_FREQ_HZ = 880.0
 BEEP_MS = 120
@@ -112,6 +117,10 @@ class AudioInput:
         self.frame_ms = int(frame_ms)
         self.blocksize = frame_samples(self.sample_rate, self.frame_ms)
         self.frame_bytes = self.blocksize * SAMPLE_WIDTH
+        #: What the device actually runs at, and which device really opened -
+        #: both may differ from the request after the fallbacks below.
+        self._capture_rate = self.sample_rate
+        self._capture_device: DeviceSpec = device
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=max(10, int(max_queue_frames)))
         self._stream: sd.RawInputStream | None = None
         self._dropped = 0
@@ -126,9 +135,15 @@ class AudioInput:
         if status:
             log.debug("Microphone: stream status %s", status)
         data = bytes(indata)
+        if self._capture_rate != self.sample_rate:
+            # The device refused the pipeline rate: convert here, in the audio
+            # thread, so that everything behind the queue (VAD, Vosk, the wire
+            # format) keeps seeing frames of exactly ``frame_ms`` at
+            # ``sample_rate``.
+            data = resample_pcm(data, self._capture_rate, self.sample_rate)
         if self._worker is not None:
             from .audio_processing import capture_time
-            item = (data, capture_time(time_info, frames, self.sample_rate), self._generation)
+            item = (data, capture_time(time_info, frames, self._capture_rate), self._generation)
             try:
                 self._raw_queue.put_nowait(item)
             except queue.Full:
@@ -160,6 +175,92 @@ class AudioInput:
                 log.warning("The microphone queue is full, frames are dropped (%d)", self._dropped)
 
     # -- control ---------------------------------------------------------
+    def _device_default_rate(self, device: DeviceSpec) -> int:
+        """The rate this device advertises, or 0 when PortAudio cannot say."""
+        try:
+            info = sd.query_devices(device, "input")
+            return int(float(info["default_samplerate"]))
+        except Exception as exc:  # noqa: BLE001 - a broken device entry is not fatal here
+            log.debug("PortAudio did not report a default rate for %r (%s)", device, exc)
+            return 0
+
+    def _describe_devices(self) -> None:
+        """Print what PortAudio can see, so the operator knows what to fix."""
+        rows: list[str] = []
+        try:
+            for index, info in enumerate(sd.query_devices()):
+                channels = int(info.get("max_input_channels", 0) or 0)
+                if channels < 1:
+                    continue
+                rate = int(float(info.get("default_samplerate", 0) or 0))
+                rows.append(f"[{index}] {info.get('name', '?')} ({rate} Hz, {channels} ch)")
+        except Exception as exc:  # noqa: BLE001 - a hint must never raise
+            log.error("PortAudio could not list the audio devices (%s)", exc)
+            return
+        if rows:
+            log.error("Microphones this PC offers:\n  %s", "\n  ".join(rows))
+        else:
+            log.error("PortAudio sees no input device at all on this PC.")
+        log.error(
+            "Hints: allow microphone access for desktop apps in the Windows privacy "
+            "settings; close whatever holds the microphone (Teams, Zoom, Discord, OBS); "
+            "then pick the right device with 'python -m client.setup' or set "
+            "client.audio.input_device in the config."
+        )
+
+    def _open_input(self) -> tuple[sd.RawInputStream, int]:
+        """Open the microphone, stepping down to what this PC really supports.
+
+        A room client installed on somebody else's PC is not the PC its config
+        was written on: the saved device index may not exist there, and a headset
+        rarely accepts the pipeline's 16 kHz. Both used to end as a bare
+        ``Error opening RawInputStream`` hours into a session, with nothing to act
+        on, so every attempt is logged, the device's own rate is tried before the
+        common ones, and the system default is the last resort.
+        """
+        rates: list[int] = [self.sample_rate]
+        device_rate = self._device_default_rate(self.device)
+        if device_rate:
+            rates.append(device_rate)
+        rates.extend(FALLBACK_RATES)
+        devices: list[DeviceSpec] = [self.device]
+        if self.device is not None:
+            devices.append(None)
+        seen: set[tuple[object, int]] = set()
+        last: Exception | None = None
+        for device in devices:
+            for rate in rates:
+                if rate <= 0 or (device, rate) in seen:
+                    continue
+                seen.add((device, rate))
+                try:
+                    stream = sd.RawInputStream(
+                        samplerate=rate,
+                        blocksize=frame_samples(rate, self.frame_ms),
+                        device=device,
+                        channels=1,
+                        dtype="int16",
+                        callback=self._callback,
+                    )
+                except Exception as exc:  # noqa: BLE001 - PortAudio says no for many reasons
+                    last = exc
+                    log.debug("Microphone %r at %d Hz is unavailable (%s)", device, rate, exc)
+                    continue
+                if device != self.device:
+                    log.warning("The configured microphone %r could not be opened; "
+                                "using the system default instead", self.device)
+                if rate != self.sample_rate:
+                    log.warning("The microphone does not accept %d Hz; capturing at %d Hz and "
+                                "resampling to %d Hz", self.sample_rate, rate, self.sample_rate)
+                self._capture_rate = int(rate)
+                self._capture_device = device
+                return stream, int(rate)
+        self._describe_devices()
+        raise RuntimeError(
+            f"could not open any microphone (tried device {self.device!r} and the system "
+            f"default at {sorted(set(rates))} Hz); the last PortAudio error was: {last}"
+        ) from last
+
     def start(self) -> None:
         if self._stream is not None:
             return
@@ -172,21 +273,14 @@ class AudioInput:
             except Exception as exc:
                 log.warning('Audio processing unavailable; using original microphone: %s', exc)
                 self._processor.close()
-        self._stream = sd.RawInputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.blocksize,
-            device=self.device,
-            channels=1,
-            dtype="int16",
-            callback=self._callback,
-        )
+        self._stream, _ = self._open_input()
         self._stream.start()
         log.info(
             "Microphone started: device=%s, %d Hz, frame %d ms (%d samples)",
-            self.device if self.device is not None else "default",
-            self.sample_rate,
+            self._capture_device if self._capture_device is not None else "default",
+            self._capture_rate,
             self.frame_ms,
-            self.blocksize,
+            frame_samples(self._capture_rate, self.frame_ms),
         )
 
     def stop(self) -> None:
