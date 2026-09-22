@@ -12,18 +12,22 @@ from common.protocol import CAMERA_CLIP_MAX_BYTES, MSG_CAMERA_CLIP, MSG_CAMERA_C
 
 
 def clip_settings(seconds=5, fps=8):
-    if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 3 <= seconds <= 10:
-        raise ValueError('Clip duration must be between 3 and 10 seconds.')
+    # 60 s is the ceiling of ONE video of an alert episode (ТЗ F-702): a longer
+    # visit is recorded as several of these, never as one oversized file.
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 3 <= seconds <= 60:
+        raise ValueError('Clip duration must be between 3 and 60 seconds.')
     if type(fps) is not int or not 5 <= fps <= 10:
         raise ValueError('Clip frame rate must be between 5 and 10 FPS.')
     return float(seconds), fps
 
 
 def record_clip(camera, seconds=5, fps=8, *, cancel=None):
-    """Stream at most 100 scaled frames to a temporary MP4; no frame queue.
+    """Stream scaled frames to a temporary MP4; no frame queue.
 
     Called only off the event loop. Capture and YOLO continue independently.
     Stalled capture produces an error, not a fake video repeating one photo.
+    The size check runs after every frame, so an unusually busy scene stops the
+    recording honestly instead of producing a file the hub would refuse.
     """
     seconds, fps = clip_settings(seconds, fps)
     cancel = cancel or threading.Event()

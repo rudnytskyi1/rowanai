@@ -642,7 +642,7 @@ class CameraRequest(Envelope):
     zone: str = Field(default="", max_length=100)
     burst: int = Field(default=CAMERA_BURST_DEFAULT, ge=1, le=CAMERA_BURST_MAX)
     full: bool = False
-    clip_seconds: int = Field(default=0, ge=0, le=10)
+    clip_seconds: int = Field(default=0, ge=0, le=60)
 
 
 class ScreenshotRequest(Envelope):
@@ -651,7 +651,8 @@ class ScreenshotRequest(Envelope):
 
 class CameraClipRequest(Envelope):
     type: Literal["camera_clip_request"] = "camera_clip_request"
-    seconds: int = Field(default=5, ge=3, le=10)
+    # ТЗ F-702: one video of an alert episode may be up to a minute long.
+    seconds: int = Field(default=5, ge=3, le=60)
     fps: int = Field(default=8, ge=5, le=10)
 
 
