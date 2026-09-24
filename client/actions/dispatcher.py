@@ -222,7 +222,13 @@ class Dispatcher:
                 return False, f"unknown tool '{tool}' (known: {known})", None
 
             log.info("action %s finished: %s", action_id, detail or "ok")
-            return True, None, output
+            # The human-readable outcome goes to the hub even when a tool has no
+            # separate ``output``: the model has to be able to confirm what
+            # happened ("volume 30%"), and a result that says only ``ok: true``
+            # left it with nothing to stand on. The real-room audit of
+            # 2026-09-23 (RA-001…RA-011) caught every volume change reporting an
+            # empty result.
+            return True, None, output if output is not None else (detail or None)
 
         except asyncio.CancelledError:
             raise

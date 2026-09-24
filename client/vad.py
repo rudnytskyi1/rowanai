@@ -17,6 +17,7 @@ import collections
 import inspect
 import logging
 import math
+import re
 import statistics
 import time
 from array import array
@@ -53,6 +54,36 @@ DEFAULT_PRE_ROLL_MS = 300
 #: If the microphone stops delivering frames mid-utterance, give up after this.
 STALL_TIMEOUT_S = 3.0
 
+#: Владелец 2026-09-23: «если я на секунду перестану говорить, запись уже
+#: останавливается — надо грамотно сделать». Слова, после которых пауза почти
+#: наверняка не конец реплики, а раздумье перед продолжением: «открой ютуб И
+#: включи видео». Живая расшифровка приходит в клиент кадром
+#: ``transcript_partial`` (хаб её уже считает), поэтому вопрос «закончил ли
+#: человек» решается по её последнему слову, а не по громкости.
+UNFINISHED_TAIL_WORDS = frozenset({
+    "a", "also", "an", "and", "as", "at", "because", "but", "by", "for",
+    "from", "in", "into", "of", "on", "or", "so", "than", "that", "the",
+    "then", "to", "with",
+    "а", "без", "будет", "бы", "в", "во", "вот", "для", "до", "если", "же",
+    "за", "и", "или", "к", "как", "ко", "на", "надо", "но", "ну", "о", "об",
+    "от", "по", "потом", "при", "про", "с", "со", "так", "то", "у", "чтобы",
+    "это", "я",
+    "entonces", "para", "pero", "por", "que", "y",
+})
+
+_TAIL_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def last_word(text: str) -> str:
+    """Последнее слово расшифровки (без регистра и знаков), ``""`` если пусто."""
+    found = _TAIL_WORD.findall(str(text or ""))
+    return found[-1].lower() if found else ""
+
+
+def sentence_unfinished(text: str) -> bool:
+    """Закончилось ли сказанное на слове-связке («и», «потом», «and»)."""
+    return last_word(text) in UNFINISHED_TAIL_WORDS
+
 FrameReader = Callable[[], Awaitable[bytes | None]]
 AudioSink = Callable[[bytes], None | Awaitable[None]]
 
@@ -64,6 +95,7 @@ class VadRecorder:
         self,
         aggressiveness: int = 2,
         silence_ms: int = 800,
+        hold_ms: int = 0,
         max_utterance_s: float = 15.0,
         sample_rate: int = 16000,
         frame_ms: int = FRAME_MS,
@@ -73,6 +105,7 @@ class VadRecorder:
         pre_roll_ms: int = DEFAULT_PRE_ROLL_MS,
         min_speech_ms: int = 250,
         energy_endpoint: bool = False,
+        hold_while: Callable[[], bool] | None = None,
     ) -> None:
         sample_rate = int(sample_rate)
         frame_ms = int(frame_ms)
@@ -93,6 +126,15 @@ class VadRecorder:
         self.frame_bytes = int(sample_rate * frame_ms // 1000) * SAMPLE_WIDTH
         self.aggressiveness = aggressiveness
         self.silence_ms = max(frame_ms, int(silence_ms))
+        #: Extra silence the recorder tolerates while the caller says the
+        #: sentence is not finished yet (``hold_while``). 0 keeps the old
+        #: behaviour: the first quiet window ends the utterance.
+        self.hold_ms = max(0, int(hold_ms))
+        #: Вопрос «человек ещё не договорил?», если он известен на всю жизнь
+        #: этого рекордера. Он же может прийти и в конкретный вызов ``record``;
+        #: аргумент вызова сильнее. Так ``client.main`` задаёт его один раз, и
+        #: подменённые в тестах рекордеры продолжают работать без изменений.
+        self.hold_while = hold_while
         self.max_utterance_s = max(1.0, float(max_utterance_s))
         self.lead_in_s = max(0.5, float(lead_in_s))
         self.onset_window = max(1, int(onset_window))
@@ -140,6 +182,7 @@ class VadRecorder:
         pre_roll: bytes = b"",
         lead_in_s: float | None = None,
         on_audio: AudioSink | None = None,
+        hold_while: Callable[[], bool] | None = None,
     ) -> bytes | None:
         """Record one utterance.
 
@@ -151,9 +194,16 @@ class VadRecorder:
         then one frame at a time, so the caller can stream to the server live
         and send nothing at all when the trigger was false.
 
+        ``hold_while`` — необязательный вопрос «человек ещё не договорил?».
+        Пока он отвечает «да», пауза не закрывает реплику: запись терпит ещё
+        ``hold_ms`` тишины (владелец 2026-09-23: пауза на секунду обрывала
+        запись). Без ``hold_ms`` или без вопроса поведение прежнее.
+
         Returns the recorded PCM, or ``None`` if no speech started in time.
         """
         lead_in = self.lead_in_s if lead_in_s is None else float(lead_in_s)
+        if hold_while is None:
+            hold_while = self.hold_while
         # The user always gets at least MIN_LEAD_IN_S to start talking.
         lead_in = max(MIN_LEAD_IN_S, lead_in)
         base_roll: list[bytes] = [pre_roll] if pre_roll else []
@@ -173,6 +223,10 @@ class VadRecorder:
         # 10% of the last silence_ms worth of frames were flagged as speech.
         tail: collections.deque[bool] = collections.deque(maxlen=silence_limit)
         tail_allowed_speech = max(0, int(silence_limit * 0.1))
+        # Сколько кадров тишины запись уже терпит СВЕРХ обычного окна, пока
+        # ``hold_while`` говорит, что человек не договорил.
+        hold_limit = max(0, int(round(self.hold_ms / self.frame_ms)))
+        held_frames = 0
         # Nothing is streamed to the server until min_speech_frames voiced frames
         # have been seen. A "recording" that ends before that is a noise blip: it
         # is dropped without the server ever hearing about it, and listening
@@ -192,9 +246,11 @@ class VadRecorder:
 
         def _reset_listening() -> None:
             nonlocal started, voiced, emitted, collected, recorded_frames, speech_level
+            nonlocal held_frames
             started = False
             voiced = 0
             emitted = False
+            held_frames = 0
             collected = list(base_roll)
             window.clear()
             tail.clear()
@@ -265,10 +321,30 @@ class VadRecorder:
                         threshold = min(-42.0, speech_level - 18.0)
                         endpoint_speech = speech and level >= threshold
                 tail.append(endpoint_speech)
+                if endpoint_speech:
+                    held_frames = 0
                 if len(tail) == silence_limit and sum(tail) <= tail_allowed_speech:
                     if not emitted:
                         noise_blip = True
                         break
+                    if hold_limit:
+                        # The ordinary window is over, but the sentence does not
+                        # look finished (see ``UNFINISHED_TAIL_WORDS``). Keep
+                        # recording until the hold runs out or the speaker
+                        # resumes; the person's next words belong to THIS turn,
+                        # so they are never lost to a one-second pause.
+                        held_frames += 1
+                        holding = False
+                        if held_frames <= hold_limit and hold_while is not None:
+                            try:
+                                holding = bool(hold_while())
+                            except Exception as exc:  # noqa: BLE001 - a hint never breaks capture
+                                log.debug("hold_while failed (%s); the pause ends the utterance", exc)
+                                holding = False
+                        if holding:
+                            continue
+                        if held_frames <= hold_limit:
+                            log.debug("Hold ended: the sentence reads as finished")
                     log.debug(
                         "~%d ms of (near-)silence - end of the utterance",
                         silence_limit * self.frame_ms,

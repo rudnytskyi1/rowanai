@@ -71,6 +71,13 @@ class VADConfig(_Strict):
 
     aggressiveness: int = Field(default=2, ge=0, le=3)
     silence_ms: int = Field(default=800, ge=0)
+    #: Владелец 2026-09-23: «если я на секунду перестану говорить, запись уже
+    #: останавливается». ``unfinished_hold_ms`` — дополнительное окно тишины,
+    #: которое запись терпит, когда сказанное явно не закончено (последнее слово
+    #: живой расшифровки — «и», «потом», «and», «then»: см.
+    #: ``client.vad.UNFINISHED_TAIL_WORDS``). ``0`` выключает удержание и
+    #: оставляет прежнее поведение: пауза ``silence_ms`` и конец реплики.
+    unfinished_hold_ms: int = Field(default=0, ge=0)
     max_utterance_s: float = Field(default=15.0, gt=0.0)
     pre_roll_ms: int = Field(default=300, ge=0)
     #: Minimum voiced audio for a recording to count as an utterance; anything

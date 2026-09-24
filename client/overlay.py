@@ -490,9 +490,10 @@ class OverlayHUD:
         """ТЗ F-512: the «Rowan is in control» badge; ``""`` clears it.
 
         Unlike the camera-off badge, this one is NOT time-boxed: while the agent
-        drives the mouse and the keyboard the badge must stay up, and the run is
-        bounded by its own 15-step limit anyway. An empty string takes it down
-        the instant the run ends or the person says «стоп».
+        drives the mouse and the keyboard the badge must stay up - and since the
+        owner lifted the 15-step ceiling (2026-09-23) nothing else bounds the
+        run, so the badge coming down is the signal that the run ended. An empty
+        string takes it down the instant the run ends or the person says «стоп».
         """
         if not self.enabled:
             return

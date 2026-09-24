@@ -7,16 +7,62 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+
+_SPACES = re.compile(r'\s+')
+_SPACED_DOT = re.compile(r'\s*\.\s*')
+_SCHEME_ONLY = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
+_HOST_PORT = re.compile(r'^[a-zA-Z0-9.\-]+:\d+(?:[/?#].*)?$')
+_LOCAL_HOSTS = ('localhost', '127.0.0.1', '::1')
 
 
 def web_url(value):
-    value = str(value or '').strip()
-    parsed = urlsplit(value)
+    """A URL the room's browser may open, or :class:`ValueError`.
+
+    The model sends what the person said, and people say "youtube.com",
+    "www.youtube.com", or - the owner's own report of 2026-09-22 - "youtube
+    .com" with a space where the dot belongs. Requiring a written scheme turned
+    every one of those into "the browser rejected the URL", so a bare host gets
+    ``https://`` in front of it and a space around a dot is read as a typo.
+
+    What is still refused is what always was: a scheme that is not http(s)
+    (``file:``, ``javascript:``, ``data:``, ``chrome:``), a URL with embedded
+    credentials, and a bare word with no domain at all ("yt"). Those are not
+    addresses, and guessing one would be inventing a destination.
+    """
+    # Only spaces and tabs are collapsed: a control character inside an address
+    # is not a typo but an attack the desktop layer refuses by name
+    # (``browser_desktop`` checks for it), so it has to survive this far.
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError('Provide a full http(s) URL without embedded credentials.')
+    if ' ' in text or '\t' in text:
+        # "youtube .com": the space sits where the dot belongs
+        text = _SPACED_DOT.sub('.', text)
+    if '://' not in text:
+        if _HOST_PORT.match(text):
+            # "localhost:8770" is the hub's own panel, "example.com:8080" a
+            # server; both are addresses that only lost their scheme.
+            scheme = 'http' if text.split(':', 1)[0].casefold() in _LOCAL_HOSTS else 'https'
+            text = f'{scheme}://{text}'
+        elif _SCHEME_ONLY.match(text):
+            # file:, javascript:, data:, chrome: - not an address we may open
+            raise ValueError('Provide a full http(s) URL without embedded credentials.')
+        else:
+            host = text.split('/', 1)[0]
+            if '.' not in host and host.casefold() != 'localhost':
+                raise ValueError(f'{value!r} has no domain: send a full http(s) URL.')
+            text = 'https://' + text
+    parsed = urlsplit(text)
+    if parsed.netloc and ' ' in parsed.netloc:
+        text = urlunsplit((parsed.scheme, _SPACES.sub('', parsed.netloc),
+                           parsed.path, parsed.query, parsed.fragment))
+        parsed = urlsplit(text)
     if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('Provide a full http(s) URL without embedded credentials.')
-    return value
+    return text
 
 
 class BrowserController:

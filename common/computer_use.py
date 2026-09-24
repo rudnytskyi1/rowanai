@@ -18,7 +18,20 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-#: ТЗ F-512: «максимум 15 шагов». Больше не позволит ни конфиг, ни этот файл.
+#: Владелец 2026-09-23: «никаких лимитов, все что его попросили — делает».
+#: ТЗ F-512 знало максимум 15 шагов на прогон; потолок снят, и ``0`` теперь
+#: значит «лимита нет» — задача идёт, пока модель не отправит ``finish``, пока
+#: человек не скажет стоп-слово или пока шаг не потребует голосового «да».
+#: Число больше нуля — это лимит, который владелец поставил сам.
+DEFAULT_MAX_STEPS = 0
+UNLIMITED_STEPS = 0
+
+#: Значение allow-list «любое приложение». Владелец ставит его сам; пустой
+#: список по-прежнему значит «агент не трогает ни одного приложения».
+ANY_APP = "*"
+
+#: Прежнее имя константы: осталось только как ссылка на прежний предел ТЗ,
+#: чтобы код, читающий его, не падал. Потолком он больше не является.
 MAX_STEPS = 15
 
 #: Что агент вообще умеет попросить у комнаты.
@@ -177,8 +190,9 @@ class ComputerUsePolicy(_Strict):
     """Что разрешено агенту в этом доме (ТЗ F-512)."""
 
     enabled: bool = False
-    #: ТЗ F-512: «максимум 15 шагов»; конфиг не может поднять планку выше.
-    max_steps: int = Field(default=MAX_STEPS, ge=1, le=MAX_STEPS)
+    #: Сколько шагов разрешено за один прогон. ``0`` — лимита нет (владелец,
+    #: 2026-09-23); положительное число — предел, который владелец поставил сам.
+    max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=0)
     #: ТЗ F-512: «allow-list приложений». Пустой список — агент не трогает
     #: НИ ОДНОГО приложения: безопасное умолчание, а не «разрешено всё».
     allowed_apps: list[str] = Field(default_factory=list)
@@ -196,9 +210,21 @@ class ComputerUsePolicy(_Strict):
         return cleaned
 
     def allows_app(self, name: Any) -> bool:
-        """Есть ли приложение в allow-list (по имени без пути, ``.exe`` и регистра)."""
+        """Есть ли приложение в allow-list (по имени без пути, ``.exe`` и регистра).
+
+        ``"*"`` в списке значит «любое приложение» — так владелец сам снимает
+        allow-list, если хочет, чтобы агент работал везде (``config.openai.yaml``,
+        решение от 2026-09-23 рядом со снятым потолком шагов).
+        """
+        if ANY_APP in self.allowed_apps:
+            return True
         wanted = normalize_app(name)
         return bool(wanted) and wanted in self.allowed_apps
+
+    @property
+    def unlimited(self) -> bool:
+        """True, когда шаги не считаются пределом (владелец снял потолок)."""
+        return self.max_steps <= UNLIMITED_STEPS
 
     def refuse(self, step: ComputerUseStep, *, index: int) -> str:
         """Причина, по которой шаг не выполняется, или ``""``.
@@ -208,7 +234,7 @@ class ComputerUsePolicy(_Strict):
         """
         if not self.enabled:
             return "computer use is switched off for this home"
-        if index >= self.max_steps:
+        if not self.unlimited and index >= self.max_steps:
             return f"the step limit of {self.max_steps} steps is reached"
         if step.action == "app" and not self.allows_app(step.app):
             return (f"{step.app or 'that application'!r} is not on the list of "
@@ -225,11 +251,14 @@ class ComputerUsePolicy(_Strict):
 
 __all__ = [
     "ACTIONS",
+    "ANY_APP",
+    "DEFAULT_MAX_STEPS",
     "MAX_STEPS",
     "SENSITIVE_RULES",
     "SYSTEM_KEY_COMBOS",
     "ComputerUsePolicy",
     "ComputerUseStep",
+    "UNLIMITED_STEPS",
     "changes_system",
     "normalize_app",
     "sensitive_reason",

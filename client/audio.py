@@ -129,11 +129,26 @@ class AudioInput:
         self._worker = None
         self._worker_stop = threading.Event()
         self._generation = 0
+        #: When the last frame really arrived (monotonic clock), or ``None``
+        #: while nothing has been captured yet. Windows leaves a WASAPI stream
+        #: open and silent when the device is re-enumerated (a headset plugged
+        #: in, a camera reconnecting): nothing raises and the queue simply never
+        #: fills again, so the only way to notice is to time the frames.
+        self._last_frame_at: float | None = None
+        #: The device status text was already reported once for this stream.
+        self._status_logged = False
 
     # -- PortAudio thread ------------------------------------------------
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         if status:
-            log.debug("Microphone: stream status %s", status)
+            # Overflow/underflow or a device that went away: the first one is
+            # worth a warning, the rest would be noise (this runs per block).
+            if self._status_logged:
+                log.debug("Microphone: stream status %s", status)
+            else:
+                self._status_logged = True
+                log.warning("Microphone: the audio device reported %s", status)
+        self._last_frame_at = time.monotonic()
         data = bytes(indata)
         if self._capture_rate != self.sample_rate:
             # The device refused the pipeline rate: convert here, in the audio
@@ -208,6 +223,19 @@ class AudioInput:
             "client.audio.input_device in the config."
         )
 
+    def _device_label(self, device: DeviceSpec) -> str:
+        """The device's own name: on somebody else's PC an index says nothing.
+
+        The room that could not hear (buro, 2026-09-23) had ``input_device: 21``
+        in its config; index 21 is a different device on every PC, so the log
+        has to name what really opened.
+        """
+        try:
+            info = sd.query_devices(device, "input")
+            return str(info.get("name") or device)
+        except Exception:  # noqa: BLE001 - a label is never worth an exception
+            return str(device)
+
     def _open_input(self) -> tuple[sd.RawInputStream, int]:
         """Open the microphone, stepping down to what this PC really supports.
 
@@ -264,6 +292,10 @@ class AudioInput:
     def start(self) -> None:
         if self._stream is not None:
             return
+        # A fresh stream gets a fresh grace period: the watchdog must not fire
+        # on the frames the previous stream never delivered.
+        self._last_frame_at = None
+        self._status_logged = False
         if self._processor is not None:
             try:
                 self._processor.start()
@@ -276,12 +308,37 @@ class AudioInput:
         self._stream, _ = self._open_input()
         self._stream.start()
         log.info(
-            "Microphone started: device=%s, %d Hz, frame %d ms (%d samples)",
+            "Microphone started: device=%s (%s), %d Hz, frame %d ms (%d samples)",
             self._capture_device if self._capture_device is not None else "default",
+            self._device_label(self._capture_device),
             self._capture_rate,
             self.frame_ms,
             frame_samples(self._capture_rate, self.frame_ms),
         )
+
+    def seconds_since_frame(self) -> float | None:
+        """Seconds since the last captured frame, or ``None`` if none ever came.
+
+        ``None`` is not "healthy": a stream that opened but never delivered a
+        block answers ``None`` forever, so the caller adds its own boot grace
+        period instead of trusting this value alone.
+        """
+        if self._last_frame_at is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_frame_at)
+
+    def reopen(self) -> tuple[bool, str]:
+        """Close the microphone and open it again after it went silent.
+
+        Returns ``(ok, what_really_happened)``: the caller keeps its own retry
+        rhythm, so a device that is still busy never crashes the room.
+        """
+        self.stop()
+        try:
+            self.start()
+        except Exception as exc:  # noqa: BLE001 - the caller retries with backoff
+            return False, f"{type(exc).__name__}: {exc}"
+        return True, f"device={self._capture_device!r} at {self._capture_rate} Hz"
 
     def stop(self) -> None:
         stream, self._stream = self._stream, None

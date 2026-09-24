@@ -65,6 +65,17 @@ _SWP_NOACTIVATE = 0x0010
 #: up; with no overlay the photo goes plain topmost, exactly as before.
 _UNDER_WINDOW: Any = None
 
+#: How often the photo is allowed to re-assert its place under the HUD. The
+#: message loop pumps about sixty times a second, and re-pinning on every pump
+#: while the HUD also raised itself made the two windows trade the top slot -
+#: the owner saw the overlay blink for as long as the picture was up
+#: (2026-09-24). The order only has to be settled, not enforced sixty times a
+#: second; half a second is far more than a full-screen window needs to steal
+#: the top.
+_PIN_INTERVAL_S = 0.5
+_LAST_PIN: tuple[int, int] = (0, 0)
+_LAST_PIN_AT = 0.0
+
 
 def set_overlay_window(source: Any) -> None:
     """Register the HUD window - a handle, or a callable returning one.
@@ -240,7 +251,13 @@ def _keep_on_top(window_name: str) -> None:
     asked to see hidden under everything else. This is cheap enough to call on
     every message-loop pump, and ``SWP_NOACTIVATE`` means it never yanks the
     keyboard away from whatever he is actually typing into.
+
+    Re-pinning the SAME place on every pump is not cheap for the eye: the HUD
+    re-raised itself on its own guard timer, so the two windows visibly traded
+    the top slot while a picture was on screen. The place is therefore only
+    re-asserted when it changes, or once every :data:`_PIN_INTERVAL_S`.
     """
+    global _LAST_PIN, _LAST_PIN_AT
     try:
         user32 = _window_api()
         hwnd = user32.FindWindowW(None, window_name)
@@ -256,6 +273,11 @@ def _keep_on_top(window_name: str) -> None:
                     after = 0
             except Exception:  # noqa: BLE001 - an unusable probe means topmost
                 after = 0
+        target = (int(hwnd), int(after or _HWND_TOPMOST))
+        now = time.monotonic()
+        if target == _LAST_PIN and now - _LAST_PIN_AT < _PIN_INTERVAL_S:
+            return
+        _LAST_PIN, _LAST_PIN_AT = target, now
         user32.SetWindowPos(
             hwnd,
             after or _HWND_TOPMOST,

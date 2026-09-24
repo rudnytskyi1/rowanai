@@ -201,8 +201,21 @@ MSG_BODY_CROP = "body_crop"
 MSG_CAMERA_FRAME = "camera_frame"
 #: v1.4: the client could not grab a camera frame; no binary frame follows.
 MSG_CAMERA_ERROR = "camera_error"
+#: A room saying something about its own gear is broken (ТЗ F-702 extension,
+#: владелец 2026-09-23: «оно должно постоянно ретраить и в тг увед слать в
+#: группу уведов если чет не работает»). Unlike ``camera_error`` this is not an
+#: answer to a request: it is the client volunteering that its camera went away
+#: or came back, so the hub can tell the owner instead of the room looking dead.
+#: ``{"type": MSG_ROOM_HEALTH, "kind": "camera", "ok": false, "detail": "…"}``
+MSG_ROOM_HEALTH = "room_health"
 MSG_CAMERA_CLIP = "camera_clip"
 MSG_CAMERA_CLIP_ERROR = "camera_clip_error"
+#: Владелец 2026-09-24: «открыть камеру и чтобы оно показывало видео с камеры на
+#: экране и все детекции». Hub -> client: ``{"type": "camera_preview", "on": true,
+#: "names": {"<track_id>": "<display name>"}}``. ``on: false`` закрывает окно.
+#: The message only turns a local window on and off; no frame of the room leaves
+#: the PC because of it (the video is drawn from the client's own capture).
+MSG_CAMERA_PREVIEW = "camera_preview"
 
 # --- server -> client -------------------------------------------------------
 MSG_READY = "ready"
@@ -331,6 +344,8 @@ CAMERA_BURST_MAX = 5
 
 # Optional hello capability. A clip is one MP4 binary frame, never PCM audio.
 CAP_CAMERA_CLIP = "camera_clip"
+#: The room can show its own camera as live video on its own screen.
+CAP_CAMERA_PREVIEW = "camera_preview"
 CAMERA_CLIP_MAX_BYTES = 20_000_000
 
 #: Error message the server sends when STT produced nothing (false wake-word).
@@ -356,6 +371,7 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_BODY_CROP,
         MSG_CAMERA_FRAME,
         MSG_CAMERA_ERROR,
+        MSG_ROOM_HEALTH,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
         MSG_OBJECT_EVENT,
@@ -447,6 +463,7 @@ __all__ = [
     "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_ERROR",
+    "MSG_ROOM_HEALTH",
     "MSG_CAMERA_CLIP",
     "MSG_CAMERA_CLIP_ERROR",
     "MSG_CAMERA_CLIP_REQUEST",
@@ -461,6 +478,8 @@ __all__ = [
     "MSG_TTS_PREFETCH",
     "MSG_TTS_PHRASE",
     "CAP_CAMERA_CLIP",
+    "CAP_CAMERA_PREVIEW",
+    "MSG_CAMERA_PREVIEW",
     "CAMERA_CLIP_MAX_BYTES",
     "MSG_READY",
     "MSG_TRANSCRIPT",

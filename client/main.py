@@ -62,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from client.actions import photos as _photos
 from client.actions.computer_use import ComputerUseSession, ComputerUseUnavailable
 from client.actions.dispatcher import Dispatcher
 from client.attention import followup_seconds
@@ -93,7 +94,7 @@ from client.posture import PostureService
 from client.presence_buffer import PresenceBuffer
 from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
 from client.tts_cache import PhraseCache
-from client.vad import VadRecorder
+from client.vad import VadRecorder, sentence_unfinished
 from client.voice_controls import ConfirmedWakeDetector, SilenceDetector
 from client.wakeword import WakeWordDetector
 from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
@@ -159,6 +160,16 @@ try:
 except Exception as _overlay_exc:  # noqa: BLE001 - pragma: no cover
     _OVERLAY_IMPORT_ERROR = f"{type(_overlay_exc).__name__}: {_overlay_exc}"
     OverlayHUD = None  # type: ignore[assignment]
+
+#: Владелец 2026-09-24: живое окно с камерой комнаты («открыть камеру ... и все
+#: детекции»). Import-guarded like the others: no display, no cv2 - no preview,
+#: while the voice path stays exactly as it was.
+_LIVE_VIEW_IMPORT_ERROR: str | None = None
+try:
+    from client.live_view import LivePreview
+except Exception as _live_exc:  # noqa: BLE001 - pragma: no cover
+    _LIVE_VIEW_IMPORT_ERROR = f"{type(_live_exc).__name__}: {_live_exc}"
+    LivePreview = None  # type: ignore[assignment]
 
 #: Audio format announced in ``utterance_start`` (SPEC §4).
 PCM_FORMAT = getattr(_protocol, "AUDIO_FORMAT", "pcm_s16le")
@@ -229,6 +240,18 @@ INBOX_POLL_S = 0.5
 #: ТЗ F-117/4.8: how much of the last reply the client keeps, so "повтори"
 #: works with no hub involved at all. Half a minute is one spoken answer.
 REPLY_CACHE_SECONDS = 30.0
+
+#: A room that cannot hear is worse than a room that cannot see: on buro the
+#: microphone stream stayed open and silent for 17 minutes and «rowanai не
+#: отзывается» was the only symptom - no exception, no log line, nothing to
+#: retry. Windows leaves a WASAPI stream open and silent when the device is
+#: re-enumerated, so the client times the frames itself (ТЗ F-702 extension).
+MIC_STALL_S = 8.0
+#: How often the watchdog looks at the frame clock.
+MIC_WATCH_PERIOD_S = 2.0
+#: Reopening a microphone that somebody else holds a hundred times a minute
+#: helps nobody; the room keeps trying, just not in a tight loop.
+MIC_REOPEN_MIN_GAP_S = 15.0
 
 
 def human_seconds(seconds: int) -> str:
@@ -357,7 +380,17 @@ def clip_output(value: Any) -> str | None:
 
 
 def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
-    """Build the ``hello`` payload from the client config (SPEC §4.1)."""
+    """Build the ``hello`` payload from the client config (SPEC §4.1).
+
+    Владелец 2026-09-23: «что за фигня? всм cloud decisions выключены?». Комната
+    подключалась БЕЗ токена вообще, поэтому хаб не знал её ``home_id`` — и молча
+    выключал всё, что к дому привязано: облачное чтение реплики (Jev), запись
+    лиц, тела и убеждений (ТЗ 4.3), облачный взгляд на кадр, тихие часы. Токен
+    читается из переменной окружения, имя которой стоит в конфиге
+    (``client.token_env``): сам секрет живёт только в окружении или в ``.env``
+    рядом с конфигом. Без токена всё остаётся как было — v1 ``hello``, который
+    хаб принимает до конца фазы 2.
+    """
     kind = str(_attr(cfg_client, "kind") or "room_pc")
     if kind not in {"room_pc", "phone", "sensor_node"}:
         kind = "room_pc"
@@ -378,7 +411,8 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
     capabilities = ["voice_confirmation", "live_transcript"]
     if kind == "room_pc":
         capabilities.append(_protocol.CAP_CAMERA_CLIP)
-    return {
+        capabilities.append(_protocol.CAP_CAMERA_PREVIEW)
+    payload = {
         "type": MSG_HELLO,
         "client_id": str(_attr(cfg_client, "client_id") or "client"),
         "kind": kind,
@@ -393,6 +427,24 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
         # него на самом деле (а не хаб угадывает по своим воспоминаниям).
         "privacy": bool(privacy),
     }
+    token = _client_token(cfg_client)
+    if token:
+        payload["token"] = token
+        # ТЗ 13: v2 hello; ``home_id`` хаб берёт из токена, а не из тела, поэтому
+        # кадр несёт только клиента, которого этот токен и подтвердит.
+        payload["proto"] = 2
+        home = _opt_str(_attr(cfg_client, "home_id"))
+        if home:
+            payload["home_id"] = home
+    return payload
+
+
+def _client_token(cfg_client: Any) -> str:
+    """The hub token of this client from the environment, or ``''`` (ТЗ 4.3)."""
+    name = str(_attr(cfg_client, "token_env") or "").strip()
+    if not name:
+        return ""
+    return str(os.environ.get(name, "") or "").strip()
 
 
 def resolve_path(raw: Any) -> Path:
@@ -447,6 +499,12 @@ class JarvisClient:
         self.vad = VadRecorder(
             aggressiveness=int(vad_cfg.aggressiveness),
             silence_ms=int(vad_cfg.silence_ms),
+            # Владелец 2026-09-23: пауза на секунду не должна закрывать реплику.
+            # Хаб уже считает живую расшифровку и присылает её кадром
+            # ``transcript_partial``; если последнее слово — «и»/«потом»/«and»,
+            # запись терпит ещё ``unfinished_hold_ms`` тишины.
+            hold_ms=int(getattr(vad_cfg, "unfinished_hold_ms", 0) or 0),
+            hold_while=self._sentence_unfinished,
             max_utterance_s=float(vad_cfg.max_utterance_s),
             sample_rate=self.sample_rate,
             frame_ms=self.frame_ms,
@@ -476,6 +534,10 @@ class JarvisClient:
         self._notice_tts = False
         self._enrollment_until = 0.0
         self._live_turn_id = ''
+        #: Живая расшифровка текущей реплики (хаб присылает её как
+        #: ``transcript_partial``). По её последнему слову решается, терпеть ли
+        #: паузу: «открой ютуб и…» не должно закрываться на «и».
+        self._partial_text = ''
         self._recording_live = False
         self._selection_until = 0.0
         self._quiet_turn = False
@@ -567,6 +629,11 @@ class JarvisClient:
         self._idle_interrupted = False     # the wake word cut the greeting
         self._idle_playing = False         # audio still queued for the speaker
         self._idle_drain_task: asyncio.Task | None = None
+        # -- microphone watchdog (ТЗ F-702 extension, владелец 2026-09-23) ---
+        self._mic_task: asyncio.Task | None = None
+        self._mic_trouble = False          # the hub was told the room is deaf
+        self._mic_trouble_since = 0.0      # when the silence started
+        self._mic_stream_started = 0.0     # grace before the first verdict
 
         camera_cfg = _attr(self.ccfg, "camera")
         self.camera: Any | None = None
@@ -597,6 +664,13 @@ class JarvisClient:
         self.viewer: Any | None = ImageViewer() if ImageViewer is not None else None
         if self.viewer is None:
             log.debug("The detections viewer is not importable: %s", _VIEWER_IMPORT_ERROR)
+
+        # -- live camera preview (owner 2026-09-24) -------------------------
+        #: The window is created on demand by ``camera_preview`` and lives only
+        #: while the hub keeps it on; it draws from the capture thread's frames.
+        self.live_view: Any | None = None
+        if LivePreview is None:
+            log.debug("The live camera preview is not importable: %s", _LIVE_VIEW_IMPORT_ERROR)
 
         # -- sci-fi HUD overlay --------------------------------------------
         if OverlayHUD is not None:
@@ -663,6 +737,8 @@ class JarvisClient:
         self._reconnect_task = None
         await self._cancel_task(getattr(self, "_offline_task", None), "offline watch")
         self._offline_task = None
+        await self._cancel_task(getattr(self, "_mic_task", None), "microphone watchdog")
+        self._mic_task = None
         await self._stop_reader()
         await self._cancel_task(self._dismiss_task, 'silence acknowledgement')
         await self._cancel_task(self._idle_drain_task, "proactive playback")
@@ -679,6 +755,11 @@ class JarvisClient:
                 await asyncio.to_thread(viewer.close)
             except Exception as exc:  # pragma: no cover - teardown
                 log.debug("Error while stopping the detections viewer: %s", exc)
+        if getattr(self, 'live_view', None) is not None:
+            try:
+                await asyncio.to_thread(self._stop_live_preview)
+            except Exception as exc:  # pragma: no cover - teardown
+                log.debug("Error while stopping the live camera preview: %s", exc)
         try:
             self.overlay.stop()
         except Exception as exc:  # pragma: no cover - teardown
@@ -769,6 +850,82 @@ class JarvisClient:
             log.warning("Could not start the camera service: %s - running voice only", exc)
 
     # ------------------------------------------------------------------
+    # microphone watchdog (ТЗ F-702 extension: «rowanai buropc не отзывается»)
+    # ------------------------------------------------------------------
+    def _start_microphone_watch(self) -> None:
+        """Time the microphone frames, so a silent stream cannot hide.
+
+        On buro the stream stayed open and delivered nothing for 17 minutes:
+        the camera kept working, the client looked alive in its own log, and no
+        wake word could ever fire. Nothing raises in that state, so the room
+        has to notice it by itself - and tell the owner, because a room that
+        cannot hear cannot be asked what is wrong either.
+        """
+        self._mic_stream_started = time.monotonic()
+        self._mic_task = asyncio.get_running_loop().create_task(self._watch_microphone())
+
+    async def _watch_microphone(self) -> None:
+        last_reopen = 0.0
+        while not self._stopping:
+            await asyncio.sleep(MIC_WATCH_PERIOD_S)
+            if self._stopping:
+                return
+            last_reopen = await self._microphone_watch_step(last_reopen=last_reopen)
+
+    async def _microphone_watch_step(self, *, last_reopen: float) -> float:
+        """One watchdog pass; returns when the microphone was last reopened.
+
+        Split out of the loop so tests can drive it without sleeping: a room
+        that cannot hear is the one failure it cannot describe by voice.
+        """
+        now = time.monotonic()
+        silent_for = self.audio_in.seconds_since_frame()
+        if silent_for is None:
+            # The stream is open but has not delivered a single block yet.
+            silent_for = max(0.0, now - self._mic_stream_started)
+        if silent_for < MIC_STALL_S:
+            if self._mic_trouble:
+                self._mic_trouble = False
+                down_for = max(0.0, now - self._mic_trouble_since)
+                log.info("The microphone is delivering frames again "
+                         "(it was silent for %.1f s)", down_for)
+                await self._report_microphone_health(
+                    True, f"frames are back after {down_for:.0f} s")
+            return last_reopen
+        if not self._mic_trouble:
+            self._mic_trouble = True
+            self._mic_trouble_since = now
+            log.warning(
+                "The microphone stopped delivering frames (%.1f s of silence) - "
+                "reopening it: while it is silent this room cannot hear the wake "
+                "word at all", silent_for,
+            )
+            await self._report_microphone_health(
+                False, f"no audio frames for {silent_for:.0f} s")
+        if now - last_reopen < MIC_REOPEN_MIN_GAP_S:
+            return last_reopen
+        ok, detail = await asyncio.to_thread(self.audio_in.reopen)
+        self._mic_stream_started = time.monotonic()
+        if ok:
+            log.info("The microphone was reopened (%s)", detail)
+        else:
+            log.warning("Could not reopen the microphone (%s) - will keep trying", detail)
+        return now
+
+    async def _report_microphone_health(self, ok: bool, detail: str) -> None:
+        """Tell the hub the room went deaf or can hear again (ТЗ F-702 extension)."""
+        try:
+            async with self._wire_lock:
+                await self.ws.send_json({
+                    "type": _protocol.MSG_ROOM_HEALTH,
+                    "kind": "microphone",
+                    "ok": bool(ok),
+                    "detail": str(detail)[:200],
+                })
+        except Exception as exc:  # noqa: BLE001 - a notice is never worth a crash
+            log.debug("Could not report microphone health: %s", exc)
+
+    # ------------------------------------------------------------------
     # main loop
     # ------------------------------------------------------------------
     async def run(self) -> None:
@@ -780,6 +937,7 @@ class JarvisClient:
             await self._setup_wakeword()
             self._start_ota()
             self.audio_in.start()
+            self._start_microphone_watch()
             self._start_camera()
             try:
                 self.overlay.start()
@@ -1075,6 +1233,14 @@ class JarvisClient:
         await self._cancel_task(task, "socket reader")
         clip, self._camera_clip_task = getattr(self, '_camera_clip_task', None), None
         await self._cancel_task(clip, 'camera clip')
+        # Владелец 2026-09-24: живое окно камеры живёт только вместе с
+        # подключением - после разрыва его никто не выключит, а кадры комнаты на
+        # чужом экране оставаться не должны.
+        if getattr(self, 'live_view', None) is not None:
+            try:
+                await asyncio.to_thread(self._stop_live_preview)
+            except Exception as exc:  # noqa: BLE001 - teardown never breaks the loop
+                log.debug('Could not stop the live camera preview (%s)', exc)
         self._idle_stream_active = False
         self._idle_tts_active = False
         # v1.6: an image_show header with no binary yet must not survive a
@@ -1144,6 +1310,10 @@ class JarvisClient:
                 self._silence_locally()
                 self._dismiss_ack.set()
             return
+        if isinstance(msg, dict) and msg.get('type') == _protocol.MSG_CAMERA_PREVIEW:
+            # Владелец 2026-09-24: живое окно с камерой комнаты.
+            await self._handle_camera_preview(msg)
+            return
         if getattr(self, '_quiet_turn', False):
             # Camera presence may continue; no stale speech, action or overlay
             # update is allowed to revive a dismissed conversation.
@@ -1174,6 +1344,7 @@ class JarvisClient:
         if mtype == _protocol.MSG_TRANSCRIPT_PARTIAL:
             if (getattr(self, '_recording_live', False)
                     and msg.get('utterance_id') == self._live_turn_id):
+                self._partial_text = str(msg.get('text') or '')
                 self.overlay.transcript(msg)
             return
         if mtype == _protocol.MSG_HUB_STATUS:
@@ -1194,6 +1365,12 @@ class JarvisClient:
             # the header just announces the ONE binary frame that follows it.
             if msg.get("hide"):
                 # No frame follows: the owner asked to dismiss the photo.
+                # The picture lives in Windows' photo app now, so its window is
+                # closed the same way the app controller closes an app.
+                try:
+                    await asyncio.to_thread(_photos.close_shown_photos)
+                except Exception as exc:  # noqa: BLE001 - never fatal
+                    log.debug("Could not close the photo-app window: %s", exc)
                 viewer = self.viewer
                 if viewer is not None:
                     try:
@@ -1864,6 +2041,19 @@ class JarvisClient:
             raise _Stopping()
         return frame
 
+    def _sentence_unfinished(self) -> bool:
+        """Не договорил ли человек? Ответ по последнему слову живой расшифровки.
+
+        Владелец 2026-09-23: «если я на секунду даже перестану говорить, то уже
+        запись остановится». Пауза после слова-связки («и», «потом», «and») —
+        это раздумье, а не конец реплики, поэтому VAD терпит её дольше
+        (``client.vad.unfinished_hold_ms``). Расшифровку присылает хаб кадром
+        ``transcript_partial``: клиент не гадает по громкости, он читает то, что
+        уже понято. Пустая расшифровка — «не знаю», и тогда пауза закрывает
+        реплику как раньше.
+        """
+        return sentence_unfinished(getattr(self, '_partial_text', '') or '')
+
     def _split_frames(self, chunk: bytes) -> Iterator[bytes]:
         """Split buffered audio into ~30 ms pieces for streaming (SPEC §7 step 4)."""
         size = self.frame_bytes
@@ -1894,6 +2084,7 @@ class JarvisClient:
                 # this turn. The hub echoes the same id back.
                 self._live_turn_id = new_ulid()
                 self._recording_live = True
+                self._partial_text = ''
                 # ТЗ F-103: tell the hub whether this utterance came from the
                 # follow-up window, so D-02/D-11 can judge addressability with
                 # the fact only the client has - the microphone was already
@@ -2873,6 +3064,66 @@ class JarvisClient:
         except Exception as exc:  # noqa: BLE001 - the camera never breaks the client
             log.warning("Could not answer the camera request: %s", exc)
 
+    async def _handle_camera_preview(self, msg: dict[str, Any]) -> None:
+        """Владелец 2026-09-24: show the room camera live, with all detections.
+
+        The hub turns the window on and off; the frames never leave this PC -
+        the window draws from the same capture thread the room already runs, and
+        the hub only says which track it has already named (``names``), so a
+        person is labelled exactly as in an alert clip. A room whose camera is
+        denied or off answers with an honest error instead of an empty window.
+        """
+        wanted = msg.get('on')
+        if not isinstance(wanted, bool):
+            wanted = str(wanted).strip().casefold() in {'1', 'true', 'yes', 'on'}
+        label = str(msg.get('label') or _attr(self.ccfg, 'client_id') or '')[:80]
+        if not wanted:
+            await asyncio.to_thread(self._stop_live_preview)
+            await self._send_camera_preview_status(ok=True, running=False, label=label)
+            return
+        if LivePreview is None:
+            await self._send_camera_preview_status(
+                ok=False, running=False, label=label,
+                error=f"the live preview is not importable ({_LIVE_VIEW_IMPORT_ERROR})")
+            return
+        preview = self.live_view
+        if preview is None:
+            preview = self.live_view = LivePreview(self.camera, label=label or 'room')
+        try:
+            preview.update_names(msg.get('names'))
+            started = await asyncio.to_thread(preview.start)
+        except Exception as exc:  # noqa: BLE001 - a window is never a voice failure
+            log.warning('Could not start the live camera preview: %s', exc)
+            started = False
+        status = preview.status()
+        log.info('Live camera preview %s (%s)', 'on' if started else 'unavailable',
+                 status.get('error') or f"{status.get('frames', 0)} frame(s)")
+        await self._send_camera_preview_status(ok=bool(started), running=bool(status.get('running')),
+                                              label=label or str(status.get('label') or ''),
+                                              error=str(status.get('error') or ''))
+
+    def _stop_live_preview(self) -> None:
+        """Close the window; safe to call when it was never opened."""
+        preview, self.live_view = self.live_view, None
+        closer = getattr(preview, 'stop', None)
+        if callable(closer):
+            closer()
+
+    async def _send_camera_preview_status(self, *, ok: bool, running: bool, label: str = '',
+                                          error: str = '') -> None:
+        """Tell the hub what the window is doing - the tool reports this, not a guess."""
+        payload: dict[str, Any] = {'type': _protocol.MSG_ACTION_RESULT,
+                                   'name': 'camera_preview', 'ok': bool(ok),
+                                   'running': bool(running)}
+        if label:
+            payload['label'] = label[:80]
+        if error:
+            payload['error'] = str(error)[:200]
+        try:
+            await self.ws.send_json(payload)
+        except Exception as exc:  # noqa: BLE001 - a lost status is not a lost window
+            log.debug('Could not report the live preview state (%s)', exc)
+
     async def _handle_camera_clip_request(self, msg: dict[str, Any]) -> None:
         event_id = str(msg.get('event_id') or '')[:100]
         try:
@@ -2884,8 +3135,16 @@ class JarvisClient:
                 await self.ws.send_json(failure)
                 return
             from client.camera_clips import serve_clip
+            # Владелец 2026-09-24: the hub tells the room who it already knows
+            # in this frame, so the alert video carries the names over the boxes.
+            names = msg.get('names') if isinstance(msg.get('names'), dict) else None
+            try:
+                preroll = msg.get('preroll')
+                preroll = None if preroll is None else max(0.0, min(10.0, float(preroll)))
+            except (TypeError, ValueError):
+                preroll = None
             await serve_clip(self.camera, msg.get('id'), msg.get('seconds', 5), msg.get('fps', 8),
-                             event_id=event_id)
+                             event_id=event_id, names=names, preroll=preroll)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2920,10 +3179,26 @@ class JarvisClient:
         if self.viewer is None:
             log.debug("No detections viewer available - ignoring the photo")
             return
-        # ТЗ F-708: the photo window re-pins itself as always-on-top, so the HUD
-        # has to keep winning while it is up - otherwise the badges and the
-        # transcript end up hidden under the picture the owner asked for.
-        self.overlay.keep_on_top(ttl_s + 1.0)
+        # Владелец 2026-09-24: «когда картинку показывает на экране можно ее
+        # сохранить как .temp куда-то и открыть в приложении фото? и проблема
+        # исправлена» - про мигающий оверлей. The photo is opened by Windows'
+        # own viewer now, so nothing trades the top slot with the HUD. Our own
+        # window stays as the fallback when Windows cannot open the file.
+        try:
+            path = await asyncio.to_thread(_photos.show_pushed_photo, data, title)
+            log.info("Showed the photo through the Windows photo app: %s", path.name)
+            return
+        except Exception as exc:  # noqa: BLE001 - fall back to our own window
+            log.warning("Could not open the photo in the photo app (%s) - "
+                        "falling back to the HUD viewer", exc)
+        # ТЗ F-708: the photo parks itself directly BELOW the HUD window
+        # (``viewer.set_overlay_window``), so the badges and the transcript stay
+        # readable without a fight. Raising the HUD again and again for the
+        # whole TTL is what made the overlay blink while a picture was up: the
+        # photo re-pinned itself sixty times a second, the HUD four times a
+        # second, and the two windows traded the top slot in front of the owner
+        # (2026-09-24). One settle-raise is enough once the photo goes below.
+        self.overlay.keep_on_top(0.0)
         try:
             await asyncio.to_thread(self.viewer.show, data, title, ttl_s)
         except Exception as exc:  # noqa: BLE001 - never let a viewer bug break the reader
